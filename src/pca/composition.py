@@ -1,0 +1,152 @@
+"""Composition root — the only place that wires adapters to ports.
+
+No service constructs its own dependencies. Everything is assembled here and
+injected, which is what makes every L3 service testable against fakes and what
+allows Unit 1a to have been built and verified with no database at all.
+
+Startup order matters and each step can deliberately fail the boot:
+
+    1. configuration            fail on missing GOOGLE_API_KEY / Neo4j password
+    2. migration checksums      fail if an applied migration was edited
+    3. apply pending migrations transactional, per file
+    4. Neo4j version gate       fail if older than 5.26 (ADR-003)
+    5. Graphiti indices         idempotent
+    6. recover pending episodes re-ingest work lost to a crash (ADR-008)
+
+Steps 2 and 4 exist because both failures otherwise surface much later as
+confusing runtime errors rather than a clear startup message.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+from pca.adapters.clock.system_clock import SystemClockAdapter
+from pca.adapters.gemini.provider import GeminiProviderAdapter
+from pca.adapters.graphiti.memory_graph import GraphitiMemoryAdapter
+from pca.adapters.postgres.conversation_repository import PostgresConversationRepository
+from pca.adapters.postgres.episode_repository import PostgresEpisodeRepository
+from pca.adapters.postgres.store import PostgresStoreAdapter
+from pca.config.migrations import MigrationRunner
+from pca.config.settings import Settings, get_settings
+from pca.observability.logging import configure_logging, get_logger
+from pca.orchestration.conversation_workflow import ConversationWorkflow
+from pca.services.context_assembly import ContextAssemblyService
+from pca.services.conversation import ConversationService
+from pca.services.episodes import EpisodeService
+from pca.services.extraction import ExtractionService
+from pca.services.retrieval import RetrievalService
+from pca.services.time_resolver import TimeResolver
+
+_log = get_logger(__name__)
+
+
+@dataclass
+class Container:
+    """Assembled application. Held on app.state and injected into routers."""
+
+    settings: Settings
+    clock: SystemClockAdapter
+    store: PostgresStoreAdapter
+    graph: GraphitiMemoryAdapter
+    provider: GeminiProviderAdapter
+    migrations: MigrationRunner
+    conversations: ConversationService
+    episodes: EpisodeService
+    extraction: ExtractionService
+    retrieval: RetrievalService
+    assembly: ContextAssemblyService
+    conversation_workflow: ConversationWorkflow
+
+
+def build_container(settings: Settings | None = None) -> Container:
+    """Wire everything. Performs no I/O — see `start` for that."""
+    settings = settings or get_settings()
+    configure_logging(settings.log_level)
+
+    clock = SystemClockAdapter(zone=settings.user_timezone)
+    store = PostgresStoreAdapter(dsn=settings.postgres_dsn)
+
+    graph = GraphitiMemoryAdapter(
+        uri=settings.neo4j_uri,
+        user=settings.neo4j_user,
+        password=settings.neo4j_password,
+        api_key=settings.google_api_key,
+        llm_model=settings.llm_model,
+        small_model=settings.llm_small_model,
+        embedding_model=settings.embedding_model,
+        reranker_model=settings.reranker_model,
+    )
+
+    provider = GeminiProviderAdapter(
+        api_key=settings.google_api_key,
+        default_model=settings.llm_model,
+        small_model=settings.llm_small_model,
+    )
+
+    conversation_repository = PostgresConversationRepository(store)
+    episode_repository = PostgresEpisodeRepository(store, clock)
+
+    conversations = ConversationService(repository=conversation_repository, clock=clock)
+    episodes = EpisodeService(
+        repository=episode_repository,
+        graph=graph,
+        clock=clock,
+        llm_model=settings.llm_model,
+        embedding_model=settings.embedding_model,
+    )
+    extraction = ExtractionService(
+        provider=provider,
+        resolver=TimeResolver(),
+        model=settings.llm_model,
+    )
+    retrieval = RetrievalService(graph=graph)
+    assembly = ContextAssemblyService()
+
+    workflow = ConversationWorkflow(
+        conversations=conversations,
+        retrieval=retrieval,
+        assembly=assembly,
+        provider=provider,
+        model=settings.llm_model,
+    )
+
+    return Container(
+        settings=settings,
+        clock=clock,
+        store=store,
+        graph=graph,
+        provider=provider,
+        migrations=MigrationRunner(store, clock, Path("migrations")),
+        conversations=conversations,
+        episodes=episodes,
+        extraction=extraction,
+        retrieval=retrieval,
+        assembly=assembly,
+        conversation_workflow=workflow,
+    )
+
+
+async def start(container: Container) -> None:
+    """Run the startup sequence. Raises rather than degrading."""
+    container.settings.require_runtime_secrets()
+
+    await container.migrations.verify_checksums()
+    applied = await container.migrations.apply_pending()
+    if applied:
+        _log.info("migrations_applied", versions=[a.version for a in applied])
+
+    await container.graph.initialise()
+
+    recovered = await container.episodes.recover_pending()
+    if recovered:
+        _log.info("pending_episodes_recovered", count=len(recovered))
+
+    _log.info("application_started", llm=container.settings.llm_model)
+
+
+async def stop(container: Container) -> None:
+    await container.graph.close()
+    await container.store.close()
+    _log.info("application_stopped")

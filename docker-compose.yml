@@ -1,0 +1,65 @@
+# Local development stack. NFR-03.1, NFR-03.4.
+#
+# Authored in Unit 1a but NOT YET RUN — no container runtime is installed on the
+# development machine (constraint C-19). Unit 1b activates this.
+#
+# Everything here is free and self-hosted (NFR-03.2). The only paid dependency in
+# the whole system is the Gemini API (NFR-03.3).
+#
+# SECURITY NOTE (constraint C-8): there is no authentication anywhere in this
+# application. Both services below bind to 127.0.0.1 only. Do not change those
+# bindings or expose these ports to a network interface without adding
+# authentication first — doing so would expose the full personal context store.
+
+services:
+  postgres:
+    # Pinned, not :latest. A silent major upgrade would be a schema hazard.
+    image: postgres:16.4-alpine
+    container_name: pca-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pca
+      POSTGRES_PASSWORD: pca
+      POSTGRES_DB: pca
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pca-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pca -d pca"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  neo4j:
+    # ADR-003: Graphiti requires Neo4j 5.26 or higher. An older image fails at
+    # first query with an opaque error, so the version is pinned explicitly and
+    # also gated at application startup.
+    image: neo4j:5.26-community
+    container_name: pca-neo4j
+    restart: unless-stopped
+    environment:
+      # Password supplied from .env; no default, so a blank value fails loudly.
+      NEO4J_AUTH: neo4j/${PCA_NEO4J_PASSWORD:?PCA_NEO4J_PASSWORD must be set in .env}
+      NEO4J_PLUGINS: '["apoc"]'
+      # Defaults are too small for a graph that grows over months and will
+      # manifest as slow queries rather than an obvious error.
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 2G
+      NEO4J_server_memory_pagecache_size: 1G
+    ports:
+      - "127.0.0.1:7474:7474"   # Browser — useful for visually debugging memory
+      - "127.0.0.1:7687:7687"   # Bolt
+    volumes:
+      - pca-neo4j-data:/data
+      - pca-neo4j-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+volumes:
+  pca-postgres-data:
+  pca-neo4j-data:
+  pca-neo4j-logs:
