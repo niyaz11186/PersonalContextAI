@@ -659,3 +659,88 @@ Unit 1b activation against running infrastructure.
 
 PostgreSQL and Neo4j 5.26+ are not running (constraint C-19). `docker-compose.yml`
 is authored and pinned. `SETUP.md` documents the full path on the new machine.
+
+## 2026-08-23 - Unit 1b ACTIVATED — core hypothesis test FAILED, root cause found and fixed
+
+### Result of the first live activation
+
+Startup succeeded: migrations applied, Neo4j version gate passed, indices built,
+conversation and streaming both worked. **But the core hypothesis test failed.**
+
+A fact stated in conversation A was not recalled when asked about in conversation B
+four minutes later. The assistant replied "I don't have any information about
+Priya", which was truthful — the graph was empty.
+
+### Root cause — my defect
+
+```
+"error": "episode ingestion failed: node 8dc498b7-... not found"
+"event": "episode_ingest_failed"
+```
+
+Preceded by Graphiti issuing `MATCH (e:Episodic {uuid: $uuid})`.
+
+`GraphitiMemoryAdapter.add_episode` passed `uuid=str(episode.id)`, intending it to
+assign our PostgreSQL episode id to the new graph node. Graphiti's `uuid` parameter
+means the opposite. Confirmed in `graphiti.py` line 1099:
+
+```python
+await EpisodicNode.get_by_uuid(self.driver, uuid) if uuid is not None
+```
+
+It is an **update** path. With a non-existent id it raises "node not found", so
+**every single ingestion failed from the first message onward.**
+
+### Why it was not caught earlier
+
+Three compounding reasons, all worth recording:
+
+1. **The adapter was untestable.** It constructed its own Graphiti client, so the
+   call contract could not be exercised without a live Neo4j. The 115 offline tests
+   could not have caught this.
+2. **The failure was silent by design.** `EpisodeService.ingest` caught the
+   exception, logged at WARNING, and returned False. The API returned 200. The reply
+   looked normal.
+3. **A working system and a broken one were indistinguishable.** "I have no memory
+   of that" is the correct answer for an empty graph *and* the symptom of total
+   ingestion failure. There was no observable signal separating them.
+
+Point 3 is the serious one. For a product whose entire value is remembering, a
+silent memory failure is the worst possible failure mode, and the design permitted
+it.
+
+### Fixes applied
+
+| Fix | Detail |
+|---|---|
+| The defect | Removed `uuid` from the `add_episode` call. Graphiti assigns node identity; its returned `episode.uuid` is used as `episode_ref` |
+| Testability | `graphiti` and `driver` are now injectable into the adapter purely so the call contract can be asserted without Neo4j |
+| Loud failure | `episode_ingest_failed` raised from WARNING to ERROR, with an explicit `consequence` field |
+| Observability | `/health` gained a `memory_ingestion` dependency reporting the backlog of episodes persisted but not searchable, plus a top-level note |
+| Ingestion visibility | New `graph_episode_added` log line recording entities and edges extracted, so a run of zeros is visible |
+| Startup robustness | `recover_pending` no longer raises on partial recovery. Blocking startup for a recoverable backlog leaves the app entirely unusable when it could run degraded with a visible backlog |
+
+### Tests added
+
+- `tests/unit/test_graphiti_adapter_contract.py` — 7 tests. The central one asserts
+  `uuid` is never passed to `add_episode`. Also covers reference_time being the
+  episode time rather than now, source-type mapping, and error translation.
+- `tests/unit/test_episode_service.py` — 9 tests covering the ADR-005 write
+  ordering, watermark semantics, backlog reporting, and recovery.
+- `tests/integration/test_api_skeleton.py` — added a test asserting `/health`
+  surfaces a broken ingestion pipeline.
+
+**132 tests passing.**
+
+### Everything else in the pipeline was correct
+
+Worth noting explicitly: retrieval, context assembly, the four-way epistemic split,
+SSE framing, write ordering, and the system prompt all behaved exactly as designed.
+The assistant's honest "I don't know" was the prompt working correctly on empty
+context. One line was wrong.
+
+### Pending on the Docker machine
+
+Two episodes are persisted with `ingested_at` NULL. On restart with the fix,
+`recover_pending` will re-ingest them, which also exercises the recovery path for
+real.

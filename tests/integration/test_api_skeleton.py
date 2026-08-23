@@ -147,8 +147,39 @@ def test_health_reports_each_dependency_separately(client: TestClient) -> None:
     body = client.get("/health").json()
 
     names = {d["name"] for d in body["dependencies"]}
-    assert names == {"postgres", "neo4j", "gemini"}
+    assert names == {"postgres", "neo4j", "gemini", "memory_ingestion"}
     assert body["healthy"] is True
+
+
+def test_health_surfaces_a_broken_ingestion_pipeline() -> None:
+    """The observability gap that let the memory bug hide.
+
+    Previously a total ingestion failure produced no signal: 200s everywhere, normal
+    replies, and an assistant that simply claimed no history. The backlog makes it
+    visible.
+    """
+
+    class BrokenGraph(FakeMemoryGraph):
+        async def add_episode(self, episode):  # type: ignore[no-untyped-def]
+            raise RuntimeError("node not found")
+
+    container = build_fake_container(graph=BrokenGraph())
+
+    with make_client(container) as client:
+        conversation_id = client.post("/conversations", json={}).json()["id"]
+        client.post(
+            f"/conversations/{conversation_id}/messages",
+            json={"content": "Priya lives in Pune"},
+        )
+
+        body = client.get("/health").json()
+        ingestion = next(
+            d for d in body["dependencies"] if d["name"] == "memory_ingestion"
+        )
+
+        assert ingestion["healthy"] is False
+        assert "NOT searchable" in ingestion["detail"]
+        assert body["note"] is not None and "not searchable" in body["note"]
 
 
 def test_liveness_touches_no_dependency(client: TestClient) -> None:

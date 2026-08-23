@@ -87,10 +87,21 @@ class GraphitiMemoryAdapter:
         embedding_model: str,
         reranker_model: str,
         embedding_dim: int = 3072,
+        graphiti: object | None = None,
+        driver: object | None = None,
     ) -> None:
         self._uri = uri
         self._user = user
         self._password = password
+
+        # `graphiti` and `driver` are injectable purely for testing. The uuid defect
+        # that silently disabled the whole memory pipeline was undetectable without
+        # a seam here, because the adapter constructed its own client and could only
+        # be exercised against a live Neo4j.
+        if graphiti is not None:
+            self._graphiti = graphiti  # type: ignore[assignment]
+            self._driver = driver  # type: ignore[assignment]
+            return
 
         self._graphiti = Graphiti(
             uri=uri,
@@ -177,6 +188,16 @@ class GraphitiMemoryAdapter:
         `reference_time` is the episode's `occurred_at`, not the current time. This
         matters for imported history and for background extraction: using ingestion
         time would collapse everything onto today and destroy the timeline.
+
+        **Do not pass `uuid`.** Graphiti's `uuid` parameter means "update the
+        existing episode with this id" — it calls `EpisodicNode.get_by_uuid` and
+        raises "node not found" when the id is absent. It is not a way to assign an
+        id to a new episode.
+
+        Passing our PostgreSQL episode id here was the defect that made the entire
+        memory pipeline silently store nothing: every ingestion failed, retrieval
+        searched an empty graph, and the assistant truthfully reported having no
+        history. Graphiti assigns its own node id, returned as `episode_ref`.
         """
         try:
             results = await self._graphiti.add_episode(
@@ -187,15 +208,29 @@ class GraphitiMemoryAdapter:
                 ),
                 reference_time=episode.occurred_at,
                 source=EpisodeType.message if episode.message_id else EpisodeType.text,
-                uuid=str(episode.id),
             )
         except Exception as exc:  # noqa: BLE001
             raise MemoryGraphUnavailable(f"episode ingestion failed: {exc}") from exc
 
+        graph_uuid = str(getattr(getattr(results, "episode", None), "uuid", "") or "")
+        nodes = list(getattr(results, "nodes", None) or [])
+        edges = list(getattr(results, "edges", None) or [])
+
+        # An ingestion that extracts nothing is not an error, but it is worth
+        # seeing: it usually means the message carried no durable content, and a
+        # persistent run of zeros would indicate extraction is broken.
+        _log.info(
+            "graph_episode_added",
+            episode_id=str(episode.id),
+            graph_uuid=graph_uuid,
+            entities=len(nodes),
+            edges=len(edges),
+        )
+
         return GraphIngestResult(
-            episode_ref=str(episode.id),
-            entities_touched=len(getattr(results, "nodes", []) or []),
-            edges_touched=len(getattr(results, "edges", []) or []),
+            episode_ref=graph_uuid or str(episode.id),
+            entities_touched=len(nodes),
+            edges_touched=len(edges),
         )
 
     # ------------------------------------------------------------------- search

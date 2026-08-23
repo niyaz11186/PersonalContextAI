@@ -29,6 +29,18 @@ async def health(request: Request, response: Response) -> HealthResponse:
     neo4j_ok = await container.graph.health()
     provider = await container.provider.health()
 
+    # Backlog of episodes persisted but never ingested into the graph.
+    #
+    # This check exists because a broken ingestion pipeline was previously
+    # invisible: every request returned 200, replies looked normal, and the
+    # assistant simply said it had no history — which is indistinguishable from
+    # genuinely having none. A non-zero backlog is the signal that retrieval is
+    # answering from less than it should.
+    try:
+        backlog = await container.episodes.pending_count()
+    except Exception:  # noqa: BLE001 - health must never raise
+        backlog = -1
+
     dependencies = [
         DependencyHealth(
             name="postgres",
@@ -45,6 +57,17 @@ async def health(request: Request, response: Response) -> HealthResponse:
             healthy=provider.healthy,
             detail=provider.detail or provider.model,
         ),
+        DependencyHealth(
+            name="memory_ingestion",
+            healthy=backlog == 0,
+            detail=(
+                "all episodes ingested"
+                if backlog == 0
+                else f"{backlog} episode(s) persisted but NOT searchable; restart retries them"
+                if backlog > 0
+                else "backlog could not be determined"
+            ),
+        ),
     ]
 
     # PostgreSQL is the only hard dependency. Neo4j or Gemini being down means
@@ -57,6 +80,11 @@ async def health(request: Request, response: Response) -> HealthResponse:
     note = None
     if postgres_ok and not (neo4j_ok and provider.healthy):
         note = "Serving in degraded mode; replies will disclose missing history."
+    elif backlog > 0:
+        note = (
+            f"{backlog} episode(s) are stored but not searchable. Memory written "
+            "during that period will not be recalled until they are re-ingested."
+        )
 
     return HealthResponse(healthy=overall, dependencies=dependencies, note=note)
 

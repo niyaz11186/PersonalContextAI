@@ -20,7 +20,6 @@ from __future__ import annotations
 from uuid import uuid4
 
 from pca.domain.conversation import Episode, Message
-from pca.domain.errors import MemoryGraphUnavailable
 from pca.domain.ids import EpisodeId
 from pca.observability.logging import get_logger
 from pca.ports.clock import ClockPort
@@ -82,10 +81,15 @@ class EpisodeService:
         try:
             result = await self._graph.add_episode(episode)
         except Exception as exc:  # noqa: BLE001 - translated to a domain condition
-            _log.warning(
+            # ERROR, not WARNING. A failed ingestion means this memory is invisible
+            # to retrieval until recovery runs, and the user-visible symptom is the
+            # assistant claiming to have no history — indistinguishable from
+            # genuinely having none. That must not hide at warning level.
+            _log.error(
                 "episode_ingest_failed",
                 episode_id=str(episode.id),
-                error=str(exc)[:200],
+                error=str(exc)[:300],
+                consequence="memory not searchable until recovery; /health reports the backlog",
             )
             return False
 
@@ -102,6 +106,16 @@ class EpisodeService:
         episode = await self.record_message(message)
         await self.ingest(episode)
         return episode
+
+    async def pending_count(self, limit: int = 500) -> int:
+        """How many episodes are persisted but not in the graph.
+
+        Surfaced through /health. Without this, a broken ingestion pipeline is
+        invisible: the API keeps returning 200, replies look normal, and memory
+        quietly accumulates nowhere. A non-zero backlog is the signal that
+        retrieval is answering from less than it should.
+        """
+        return len(await self._repository.pending(limit))
 
     async def recover_pending(self, limit: int = 100) -> list[EpisodeId]:
         """Re-ingest episodes left unmarked by a crash.
@@ -120,8 +134,15 @@ class EpisodeService:
                 recovered.append(episode.id)
 
         if len(recovered) < len(pending):
-            raise MemoryGraphUnavailable(
-                f"recovered {len(recovered)} of {len(pending)} pending episodes; "
-                "graph may be unavailable"
+            # Deliberately does NOT raise. An earlier version failed startup here,
+            # which is the wrong trade: a recoverable backlog would leave the
+            # application completely unusable, when it could run with reduced
+            # memory and a visible backlog on /health. The episodes stay durable in
+            # PostgreSQL and will be retried on the next start.
+            _log.error(
+                "pending_episode_recovery_incomplete",
+                recovered=len(recovered),
+                pending=len(pending),
+                consequence="those memories are not searchable; see /health backlog",
             )
         return recovered
