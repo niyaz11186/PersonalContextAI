@@ -744,3 +744,62 @@ context. One line was wrong.
 Two episodes are persisted with `ingested_at` NULL. On restart with the fix,
 `recover_pending` will re-ingest them, which also exercises the recovery path for
 real.
+
+## 2026-08-24 - Unit 1b COMPLETE — core hypothesis PROVEN
+
+### The test
+
+Conversation "Test6":
+> "My Friend suresh is a frontend developer, he lives in Viskhapatnam, Andhra Pradesh."
+
+Conversation "Test7" — a **separate** conversation, ~3 minutes later:
+> "hi Do you know Suresh? What do you know about him."
+
+Reply:
+> "I have a record indicating that Suresh lives in Visakhapatnam, which is located
+> in Andhra Pradesh. Is this the Suresh you are asking about, or is there something
+> specific you would like to know?"
+
+**Unit 1b's completion criterion is met.** A fact stated in one conversation was
+retrieved and used in another without the user repeating it.
+
+### Risk retired
+
+The top entry in the risk register — "Graphiti/Gemini/Neo4j may not compose as
+documented" — is closed. The full ADR-005 write path is verified end to end against
+live infrastructure: message persisted, episode recorded, graph ingested, watermark
+advanced, cross-conversation retrieval successful.
+
+Also validated incidentally: the `recover_pending` path re-ingested the two episodes
+stranded by the uuid defect, so crash recovery is proven rather than assumed.
+
+### Known quality gap — recall is partial
+
+Stated four things; recalled two.
+
+| Stated | Recalled |
+|---|---|
+| Suresh is a **friend** | No |
+| Suresh is a **frontend developer** | No |
+| Lives in Visakhapatnam | Yes |
+| Andhra Pradesh | Yes |
+
+The pipeline works; extraction and retrieval quality do not yet. This is precisely
+what the naive implementations were declared to be, and it maps directly onto the
+remaining units:
+
+- **Unit 2 (Extraction Depth)** — the occupation and the friend relationship were
+  not captured. Full entity extraction, typed relationships, and salience land here.
+- **Unit 4 (Retrieval Depth)** — one semantic strategy with no fusion or reranking.
+  Whether "frontend developer" was never extracted or was extracted but not
+  retrieved is currently indistinguishable, which is itself an argument for the
+  RetrievalDiagnostics work in Unit 4.
+
+The hedge in the reply ("Is this the Suresh you are asking about") is correct
+behaviour on thin evidence, but it also reflects the absence of real entity
+resolution — ADR-014's policy is Unit 2 work.
+
+### Status
+
+Inception complete. Units 1a and 1b complete. Walking skeleton live and answering
+from memory. Five units remain: 2, 3, 4, 5, 6, 7, plus Build and Test.

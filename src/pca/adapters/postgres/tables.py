@@ -22,8 +22,10 @@ companion `zone` column holding the IANA zone active at capture (ADR-011).
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     Column,
+    Float,
     ForeignKey,
     Index,
     MetaData,
@@ -125,4 +127,149 @@ __all__ = [
     "metadata",
     "schema_migrations",
     "workflow_checkpoints",
+]
+
+
+# ===========================================================================
+# Unit 2 — memory model. Mirrors 0002_memory_model.sql.
+#
+# Same rule as above: these are for query building only. The .sql files are the
+# schema authority and create_all() is never called.
+# ===========================================================================
+
+entities = Table(
+    "entities",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column("name", Text, nullable=False),
+    Column("entity_type", Text, nullable=False),
+    Column("is_provisional", Boolean, nullable=False, default=False),
+    Column("created_at", TIMESTAMP(timezone=True), nullable=False),
+    Column("merged_into", UUID(as_uuid=True), ForeignKey("entities.id"), nullable=True),
+    Column("merged_at", TIMESTAMP(timezone=True), nullable=True),
+    Column("merge_reason", Text, nullable=True),
+    Column("deleted_at", TIMESTAMP(timezone=True), nullable=True),
+)
+
+entity_aliases = Table(
+    "entity_aliases",
+    metadata,
+    Column(
+        "entity_id",
+        UUID(as_uuid=True),
+        ForeignKey("entities.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("alias", Text, primary_key=True),
+)
+
+facts = Table(
+    "facts",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column("statement", Text, nullable=False),
+    Column("origin", Text, nullable=False),
+    Column("confidence", Text, nullable=False),
+    Column("salience", Float, nullable=False, default=0.0),
+    Column("salience_category", Text, nullable=True),
+    # world time — when the fact was true
+    Column("valid_from", TIMESTAMP(timezone=True), nullable=True),
+    Column("valid_to", TIMESTAMP(timezone=True), nullable=True),
+    # belief time — when the system believed it. A separate axis (ADR-011).
+    Column("asserted_at", TIMESTAMP(timezone=True), nullable=False),
+    Column("retracted_at", TIMESTAMP(timezone=True), nullable=True),
+    # the original phrase, never discarded (ADR-010)
+    Column("temporal_raw_phrase", Text, nullable=True),
+    Column("temporal_granularity", Text, nullable=True),
+    Column("temporal_method", Text, nullable=True),
+    Column("temporal_anchor_zone", Text, nullable=True),
+    Column("superseded_by", UUID(as_uuid=True), ForeignKey("facts.id"), nullable=True),
+    Column("created_at", TIMESTAMP(timezone=True), nullable=False),
+)
+
+fact_subjects = Table(
+    "fact_subjects",
+    metadata,
+    Column(
+        "fact_id",
+        UUID(as_uuid=True),
+        ForeignKey("facts.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("entity_id", UUID(as_uuid=True), ForeignKey("entities.id"), primary_key=True),
+)
+
+events = Table(
+    "events",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column("description", Text, nullable=False),
+    Column("origin", Text, nullable=False),
+    Column("salience", Float, nullable=False, default=0.0),
+    Column("salience_category", Text, nullable=True),
+    Column("occurred_at", TIMESTAMP(timezone=True), nullable=True),
+    Column("occurred_through", TIMESTAMP(timezone=True), nullable=True),
+    Column("temporal_raw_phrase", Text, nullable=True),
+    Column("temporal_granularity", Text, nullable=True),
+    Column("temporal_method", Text, nullable=True),
+    Column("temporal_anchor_zone", Text, nullable=True),
+    Column("retracted_at", TIMESTAMP(timezone=True), nullable=True),
+    Column("created_at", TIMESTAMP(timezone=True), nullable=False),
+)
+
+event_participants = Table(
+    "event_participants",
+    metadata,
+    Column(
+        "event_id",
+        UUID(as_uuid=True),
+        ForeignKey("events.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("entity_id", UUID(as_uuid=True), ForeignKey("entities.id"), primary_key=True),
+)
+
+relationships = Table(
+    "relationships",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column("from_entity_id", UUID(as_uuid=True), ForeignKey("entities.id"), nullable=False),
+    Column("to_entity_id", UUID(as_uuid=True), ForeignKey("entities.id"), nullable=False),
+    Column("relation_type", Text, nullable=False),
+    Column("origin", Text, nullable=False),
+    Column("valid_from", TIMESTAMP(timezone=True), nullable=True),
+    Column("valid_to", TIMESTAMP(timezone=True), nullable=True),
+    Column("retracted_at", TIMESTAMP(timezone=True), nullable=True),
+    Column("created_at", TIMESTAMP(timezone=True), nullable=False),
+)
+
+# Many-to-many by design. ADR-012's corroboration rule needs to count how many
+# sources still support a memory before deciding whether deleting one should
+# retract it.
+provenance_index = Table(
+    "provenance_index",
+    metadata,
+    Column("memory_id", UUID(as_uuid=True), primary_key=True),
+    Column("memory_kind", Text, primary_key=True),
+    Column(
+        "episode_id",
+        UUID(as_uuid=True),
+        ForeignKey("episodes.id"),
+        primary_key=True,
+    ),
+    Column("conversation_id", UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=True),
+    Column("message_id", UUID(as_uuid=True), ForeignKey("messages.id"), nullable=True),
+    Column("document_id", UUID(as_uuid=True), nullable=True),
+    Column("recorded_at", TIMESTAMP(timezone=True), nullable=False),
+)
+
+__all__ += [  # noqa: PLE0605 - extending the list defined above
+    "entities",
+    "entity_aliases",
+    "event_participants",
+    "events",
+    "fact_subjects",
+    "facts",
+    "provenance_index",
+    "relationships",
 ]

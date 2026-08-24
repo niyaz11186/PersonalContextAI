@@ -148,13 +148,45 @@ async def send_message(
                 conversation, Role.ASSISTANT, text
             )
 
-        # Episode recording happens after the reply so it never delays the user.
+        # Episode recording and extraction happen after the reply so they never
+        # delay the visible response.
+        #
+        # They still run before the terminal `done` event, which means a slow
+        # extraction extends the request. That is the knowing NFR-02.3 exception
+        # carried since Unit 1b: ADR-008's ExtractionCoordinator in Unit 5 moves
+        # this off the request entirely behind a durable per-conversation barrier.
+        notices: list[str] = []
         try:
-            await container.episodes.record_and_ingest(user_message)
-        except Exception as exc:  # noqa: BLE001 - message is already durable
-            _log.warning("episode_recording_failed", error=str(exc)[:200])
+            episode = await container.episodes.record_and_ingest(user_message)
+            candidates = await container.extraction.extract(episode)
+            receipt = await container.memory.commit(candidates, episode)
 
-        yield f"data: {json.dumps({'done': True, 'correlation_id': correlation})}\n\n"
+            if receipt.needs_clarification:
+                # ADR-014: an ambiguous entity means this memory may be attached to
+                # the wrong person until someone decides. Surfaced rather than
+                # buried in a log, because silent ambiguity is how a graph quietly
+                # becomes wrong.
+                notices.append(
+                    "One or more people mentioned could not be identified "
+                    "unambiguously. The details were saved separately pending review."
+                )
+        except Exception as exc:  # noqa: BLE001 - the message is already durable
+            _log.error(
+                "post_reply_memory_write_failed",
+                error=str(exc)[:300],
+                consequence="message saved; memory not searchable until recovery",
+            )
+            notices.append(
+                "Your message was saved, but it could not be added to memory just now."
+            )
+
+        # Deliberately not named `payload`: assigning that name anywhere in this
+        # generator would shadow the request body captured from the enclosing scope
+        # and turn the earlier `payload.content` read into an UnboundLocalError.
+        done_event: dict[str, object] = {"done": True, "correlation_id": correlation}
+        if notices:
+            done_event["notices"] = notices
+        yield f"data: {json.dumps(done_event)}\n\n"
 
     return StreamingResponse(
         event_stream(),

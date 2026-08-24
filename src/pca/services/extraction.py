@@ -1,19 +1,23 @@
-"""ExtractionService — naive version for Unit 1b.
+"""ExtractionService — full extraction (Unit 2).
 
 Layer L3.
 
-Scope: extracts plain facts plus resolved time references. Entity resolution,
-salience scoring, relationships, and conflict detection are Unit 2 and Unit 3.
+Extracts facts, events, entities, and relationships from an episode, resolves time
+references, and classifies salience. Returns **candidates only** — it writes nothing.
 
-One deliberate addition beyond the "naive" plan: **temporal resolution is wired
-in here rather than deferred to Unit 2.** TimeResolver is already built and proven
-(53 tests, live contract verified), and every message extracted without it would
-carry an unanchored date that Unit 2 could not retroactively repair — the message
-anchor is available now and lost later. The cost is one extra field in the LLM
-schema; the alternative is knowingly writing wrong dates for the duration of Unit 1b.
+That separation is load-bearing. Committing here would make conflict detection
+impossible, because there would be nothing to detect against before the write.
+MemoryService owns commitment; ConflictDetectionService (Unit 3) runs in between.
 
-The ADR-010 split is preserved exactly: the model returns the *structure* of a
-time phrase and never a date. TimeResolver computes dates deterministically.
+Two divisions of labour are preserved throughout, both following the same principle
+of letting the model classify and letting code compute:
+
+    ADR-010  model returns the STRUCTURE of a time phrase; TimeResolver computes dates
+    ADR-017  model returns a salience CATEGORY; SalienceScorer computes the number
+
+In both cases asking the model for the final value directly produces figures that
+drift between identical calls, cannot be tuned coherently, and cannot be explained
+when a result looks wrong.
 """
 
 from __future__ import annotations
@@ -25,36 +29,62 @@ from pydantic import BaseModel, Field
 from pca.domain.conversation import Episode
 from pca.domain.enums import (
     Confidence,
+    EntityType,
     Granularity,
     Origin,
     RelationDirection,
     ResolutionMethod,
+    SalienceCategory,
     TemporalDirection,
     TemporalModifier,
     TemporalUnit,
 )
-from pca.domain.extraction import CandidateFact, ExtractionCandidates
-from pca.domain.temporal import OrderingConstraint, RelativeDescriptor, TemporalExpression
+from pca.domain.extraction import (
+    CandidateEntity,
+    CandidateEvent,
+    CandidateFact,
+    CandidateRelationship,
+    ExtractionCandidates,
+)
+from pca.domain.temporal import (
+    OrderingConstraint,
+    RelativeDescriptor,
+    TemporalExpression,
+)
 from pca.observability.logging import get_logger
 from pca.ports.llm import LLMProviderPort, Prompt, PromptMessage
+from pca.services.salience import SalienceScorer
 from pca.services.time_resolver import TimeResolver
 
 _log = get_logger(__name__)
 
 _SYSTEM_PROMPT = """\
-You extract durable personal context from a message.
+You extract durable personal context from a message. Be thorough.
 
-Return facts the user has stated or that follow directly from what they said.
+Extract four things:
+
+1. ENTITIES — every person, organization, place, or project named or clearly implied.
+2. FACTS — statements about the world, including who someone is, what they do,
+   where they live, what they prefer, and what changed.
+3. EVENTS — things that happened at a point or over a period.
+4. RELATIONSHIPS — how entities relate to each other (sibling, friend, colleague,
+   employer, resident_of, works_at, and so on). Use lower_snake_case relation types.
 
 Rules you must follow:
-- Mark origin as "user_stated" only for things the user actually asserted.
-  Anything you infer must be marked "ai_inferred". Never blur the two.
-- For any time reference, return only its STRUCTURE. Never compute or return a
-  date, and never guess a year. If the reference depends on another event
-  (for example "before the wedding"), report it as an event-relative reference
-  instead of a structured offset.
-- Extract aggressively: prefer including a borderline fact over dropping it.
-- Do not invent people, places, or details that are not present in the message.
+
+- ORIGIN. Mark "user_stated" only for what the user actually asserted. Anything you
+  infer, however reasonable, must be "ai_inferred". Never blur the two.
+- TIME. For any time reference, return only its STRUCTURE. Never compute or return a
+  date, and never guess a year. If a reference depends on another event (for example
+  "before the wedding"), report it as event_relative rather than as an offset.
+- CATEGORY. Classify each fact and event by what kind of information it carries. Do
+  not return a score or a priority; the category is all that is needed.
+- SPLIT COMPOUND STATEMENTS. "My friend Suresh is a frontend developer in
+  Visakhapatnam" contains a relationship (friend), an occupation, and a location.
+  Extract each separately rather than as one blob.
+- DO NOT INVENT. No people, places, dates, or details that are not present or
+  directly implied.
+- Prefer including a borderline item over dropping it.
 """
 
 
@@ -77,16 +107,59 @@ class TimeReference(BaseModel):
     ordering: Literal["before", "after"] | None = None
 
 
+_Category = Literal[
+    "significant_event",
+    "relationship",
+    "decision",
+    "commitment",
+    "state_change",
+    "identity",
+    "location",
+    "preference",
+    "transient",
+]
+
+_EntityKind = Literal["person", "organization", "place", "project", "other"]
+_Origin = Literal["user_stated", "ai_inferred"]
+
+
+class ExtractedEntity(BaseModel):
+    name: str
+    entity_type: _EntityKind
+    aliases: list[str] = Field(default_factory=list)
+
+
 class ExtractedFact(BaseModel):
     statement: str
-    origin: Literal["user_stated", "ai_inferred"]
+    origin: _Origin
     confidence: Literal["certain", "probable", "uncertain"] = "probable"
-    people: list[str] = Field(default_factory=list)
+    category: _Category = "identity"
+    about: list[str] = Field(
+        default_factory=list, description="names of entities this fact concerns"
+    )
     time_reference: TimeReference | None = None
 
 
+class ExtractedEvent(BaseModel):
+    description: str
+    origin: _Origin
+    category: _Category = "significant_event"
+    participants: list[str] = Field(default_factory=list)
+    time_reference: TimeReference | None = None
+
+
+class ExtractedRelationship(BaseModel):
+    from_entity: str
+    to_entity: str
+    relation_type: str = Field(description="lower_snake_case, e.g. sibling, works_at")
+    origin: _Origin
+
+
 class ExtractionPayload(BaseModel):
+    entities: list[ExtractedEntity] = Field(default_factory=list)
     facts: list[ExtractedFact] = Field(default_factory=list)
+    events: list[ExtractedEvent] = Field(default_factory=list)
+    relationships: list[ExtractedRelationship] = Field(default_factory=list)
 
 
 class ExtractionService:
@@ -94,19 +167,15 @@ class ExtractionService:
         self,
         provider: LLMProviderPort,
         resolver: TimeResolver,
+        salience: SalienceScorer | None = None,
         model: str | None = None,
     ) -> None:
         self._provider = provider
         self._resolver = resolver
+        self._salience = salience or SalienceScorer()
         self._model = model
 
     async def extract(self, episode: Episode) -> ExtractionCandidates:
-        """Produce candidates from an episode. Writes nothing.
-
-        Returning candidates rather than committing is what allows conflict
-        detection to run in between (Unit 3). An extraction that wrote directly
-        would make contradiction handling impossible.
-        """
         payload = await self._provider.structured(
             Prompt(
                 system=_SYSTEM_PROMPT,
@@ -117,34 +186,104 @@ class ExtractionService:
             model=self._model,
         )
 
-        facts: list[CandidateFact] = []
         constraints: list[OrderingConstraint] = []
 
-        for extracted in payload.facts:
-            expression, constraint = self._resolve_time(
-                extracted.time_reference, episode
+        entities = [
+            CandidateEntity(
+                name=e.name.strip(),
+                entity_type=EntityType(e.entity_type),
+                aliases=[a.strip() for a in e.aliases if a.strip()],
             )
+            for e in payload.entities
+            if e.name.strip()
+        ]
+
+        facts: list[CandidateFact] = []
+        for extracted in payload.facts:
+            expression, constraint = self._resolve_time(extracted.time_reference, episode)
             if constraint:
                 constraints.append(constraint)
+
+            origin = Origin(extracted.origin)
+            confidence = Confidence(extracted.confidence)
+            category = SalienceCategory(extracted.category)
             facts.append(
                 CandidateFact(
                     statement=extracted.statement,
-                    origin=Origin(extracted.origin),
-                    confidence=Confidence(extracted.confidence),
-                    subject_names=extracted.people,
+                    origin=origin,
+                    confidence=confidence,
+                    salience=self._salience.score(
+                        category=category,
+                        origin=origin,
+                        confidence=confidence,
+                        involves_entities=bool(extracted.about),
+                        is_temporally_anchored=self._is_anchored(expression),
+                    ),
+                    salience_category=category,
+                    subject_names=[n.strip() for n in extracted.about if n.strip()],
                     temporal_expression=expression,
                 )
             )
 
+        events: list[CandidateEvent] = []
+        for extracted_event in payload.events:
+            expression, constraint = self._resolve_time(
+                extracted_event.time_reference, episode
+            )
+            if constraint:
+                constraints.append(constraint)
+
+            origin = Origin(extracted_event.origin)
+            category = SalienceCategory(extracted_event.category)
+            events.append(
+                CandidateEvent(
+                    description=extracted_event.description,
+                    origin=origin,
+                    participant_names=[
+                        n.strip() for n in extracted_event.participants if n.strip()
+                    ],
+                    temporal_expression=expression,
+                    salience=self._salience.score(
+                        category=category,
+                        origin=origin,
+                        involves_entities=bool(extracted_event.participants),
+                        is_temporally_anchored=self._is_anchored(expression),
+                    ),
+                    salience_category=category,
+                )
+            )
+
+        relationships = [
+            CandidateRelationship(
+                from_name=r.from_entity.strip(),
+                to_name=r.to_entity.strip(),
+                relation_type=r.relation_type.strip().lower().replace(" ", "_"),
+                origin=Origin(r.origin),
+            )
+            for r in payload.relationships
+            if r.from_entity.strip()
+            and r.to_entity.strip()
+            # A self-referential relationship is meaningless and violates a database
+            # constraint, so it is dropped here rather than failing the whole commit.
+            and r.from_entity.strip().casefold() != r.to_entity.strip().casefold()
+        ]
+
         candidates = ExtractionCandidates(
             episode_id=episode.id,
             facts=facts,
+            events=events,
+            entities=entities,
+            relationships=relationships,
             ordering_constraints=constraints,
         )
+
         _log.info(
             "extraction_complete",
             episode_id=str(episode.id),
+            entities=len(entities),
             facts=len(facts),
+            events=len(events),
+            relationships=len(relationships),
             ordering_constraints=len(constraints),
             unresolved_times=sum(
                 1
@@ -152,10 +291,19 @@ class ExtractionService:
                 if f.temporal_expression
                 and f.temporal_expression.granularity is Granularity.UNKNOWN
             ),
+            top_salience=max((f.salience for f in facts), default=0.0),
         )
         return candidates
 
     # --------------------------------------------------------------- internals
+
+    @staticmethod
+    def _is_anchored(expression: TemporalExpression | None) -> bool:
+        return bool(
+            expression
+            and expression.granularity is not Granularity.UNKNOWN
+            and expression.resolved_from is not None
+        )
 
     def _resolve_time(
         self, reference: TimeReference | None, episode: Episode
@@ -176,8 +324,6 @@ class ExtractionService:
                 direction=RelationDirection(reference.ordering or "before"),
                 reference_phrase=reference.reference_event or "",
             )
-            # Deliberately UNRESOLVED rather than a plausible date. A fabricated
-            # date is indistinguishable from a real one once stored.
             return (
                 TemporalExpression(
                     raw_phrase=reference.raw_phrase,

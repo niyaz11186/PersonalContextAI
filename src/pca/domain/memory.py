@@ -112,14 +112,24 @@ class Entity:
 
 @dataclass(frozen=True, slots=True)
 class Relationship:
-    """A typed, temporally scoped link between two entities (FR-03.2)."""
+    """A typed, temporally scoped link between two entities (FR-03.2).
 
+    Carries its own id. Without one, provenance could not point at a relationship
+    and source deletion could not apply the corroboration rule to it — the
+    relationship would be the one memory kind that silently escaped ADR-012.
+    """
+
+    id: MemoryId
     from_entity_id: EntityId
     to_entity_id: EntityId
     relation_type: str
     origin: Origin
     provenance: list[ProvenanceRef]
     validity: TemporalValidity = field(default_factory=TemporalValidity)
+
+    def __post_init__(self) -> None:
+        if self.from_entity_id == self.to_entity_id:
+            raise ValueError("a relationship must connect two distinct entities")
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +155,38 @@ class ResolutionDecision:
     entity: Entity
     considered: list[EntityMatch] = field(default_factory=list)
     needs_clarification: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CommitReceipt:
+    """What a commit actually wrote.
+
+    Returned rather than discarded so the caller can log it and so tests can assert
+    on it. A commit that silently wrote nothing was the shape of the Unit 1b defect;
+    a receipt makes that observable.
+    """
+
+    episode_id: EpisodeId
+    fact_ids: list[MemoryId] = field(default_factory=list)
+    event_ids: list[MemoryId] = field(default_factory=list)
+    relationship_ids: list[MemoryId] = field(default_factory=list)
+    entity_ids: list[EntityId] = field(default_factory=list)
+    provisional_entity_ids: list[EntityId] = field(default_factory=list)
+    """Entities created from ambiguous mentions (ADR-014). Non-empty means something
+    needs a human decision."""
+
+    @property
+    def total(self) -> int:
+        return (
+            len(self.fact_ids)
+            + len(self.event_ids)
+            + len(self.relationship_ids)
+            + len(self.entity_ids)
+        )
+
+    @property
+    def needs_clarification(self) -> bool:
+        return bool(self.provisional_entity_ids)
 
 
 @dataclass(frozen=True, slots=True)

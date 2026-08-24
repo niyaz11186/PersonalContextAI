@@ -4,8 +4,11 @@
 - **Project Type**: Greenfield
 - **Project Name**: Personal Context AI Assistant
 - **Start Date**: 2026-08-11T12:55:00+05:30
-- **Current Stage**: CONSTRUCTION - Unit 1a COMPLETE
-- **Next Stage**: Unit 1b (Skeleton Activation) — BLOCKED on container runtime
+- **Current Stage**: CONSTRUCTION - Unit 2 code complete (198 tests). Awaiting activation.
+- **Next Stage**: Unit 2 activation on the Docker machine, then Unit 3 (Temporal Integrity)
+- **Core hypothesis**: PROVEN 2026-08-24. A fact stated in one conversation was
+  correctly recalled in a separate conversation without being repeated.
+- **Known quality gap**: recall is partial. See Unit 1b activation notes in audit.md.
 
 ## Verified Model Pins (2026-08-22)
 
@@ -50,9 +53,11 @@ all `gemini-2.5-*` (404, retired for new keys), `text-embedding-004` (nonexisten
 
 ### CONSTRUCTION PHASE — 7 Units, Strictly Sequential
 - [x] Unit 1a — Offline Foundation — COMPLETE 2026-08-22 (53 unit tests, 12/12 live checks)
-- [~] Unit 1b — Skeleton Activation — CODE COMPLETE, 115 tests passing offline.
-      Activation against live PostgreSQL + Neo4j still BLOCKED (no container runtime).
-- [ ] Unit 2 — Extraction Depth
+- [x] Unit 1b — Skeleton Activation — **COMPLETE 2026-08-24.** Completion criterion met:
+      cross-conversation recall verified live. 132 tests passing.
+      Top risk register entry retired: Graphiti + Gemini + Neo4j compose as documented.
+- [~] Unit 2 — Extraction Depth — CODE COMPLETE 2026-08-24, 198 tests passing offline.
+      Migration 0002 not yet applied; awaiting activation.
 - [ ] Unit 3 — Temporal Integrity
 - [ ] Unit 4 — Retrieval Depth
 - [ ] Unit 5 — Orchestration Depth

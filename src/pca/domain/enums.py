@@ -150,3 +150,33 @@ class RelationDirection(StrEnum):
 
     BEFORE = "before"
     AFTER = "after"
+
+
+class SalienceCategory(StrEnum):
+    """What kind of information a memory carries (ADR-017).
+
+    Salience is computed from this category by deterministic code, not returned as
+    a number by the model. Same division of labour as ADR-010's time handling: the
+    model classifies, our code does the arithmetic. Asking a model for "a salience
+    score between 0 and 1" produces values that drift between calls and cannot be
+    tuned or reasoned about; a category plus a weight table can.
+    """
+
+    SIGNIFICANT_EVENT = "significant_event"
+    RELATIONSHIP = "relationship"
+    DECISION = "decision"
+    COMMITMENT = "commitment"
+    STATE_CHANGE = "state_change"
+    IDENTITY = "identity"
+    LOCATION = "location"
+    PREFERENCE = "preference"
+    TRANSIENT = "transient"
+
+
+class MemoryKind(StrEnum):
+    """Which table a provenance row points at."""
+
+    FACT = "fact"
+    EVENT = "event"
+    RELATIONSHIP = "relationship"
+    ENTITY = "entity"

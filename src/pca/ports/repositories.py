@@ -16,8 +16,15 @@ from datetime import datetime
 from typing import Protocol
 
 from pca.domain.conversation import Conversation, Episode, Message
-from pca.domain.enums import Role
-from pca.domain.ids import ConversationId, EpisodeId, MessageId
+from pca.domain.enums import EntityType, MemoryKind, Role
+from pca.domain.ids import (
+    ConversationId,
+    EntityId,
+    EpisodeId,
+    MemoryId,
+    MessageId,
+)
+from pca.domain.memory import Entity, Event, Fact, ProvenanceRef, Relationship
 
 
 class ConversationRepositoryPort(Protocol):
@@ -63,6 +70,115 @@ class ConversationRepositoryPort(Protocol):
     ) -> Sequence[Message]:
         """Messages either side of a target, for provenance excerpts (FR-09.3)."""
         ...
+
+
+class EntityRepositoryPort(Protocol):
+    """Entities and their aliases (FR-03.1, FR-03.4).
+
+    Lookup is deliberately by name and alias rather than by embedding similarity.
+    ADR-014 requires that ambiguity be *detected* rather than resolved, and a
+    similarity score is exactly the kind of signal that invites silent merging.
+    """
+
+    async def create(
+        self,
+        entity_id: EntityId,
+        name: str,
+        entity_type: EntityType,
+        created_at: datetime,
+        is_provisional: bool = False,
+        aliases: Sequence[str] = (),
+    ) -> Entity: ...
+
+    async def get(self, entity_id: EntityId) -> Entity | None: ...
+
+    async def find_by_name(self, name: str) -> Sequence[Entity]:
+        """Case-insensitive match on name or alias.
+
+        Returns **all** matches, including duplicates. Returning a single "best"
+        entity here would hide the ambiguity that ADR-014 exists to surface.
+        """
+        ...
+
+    async def list_provisional(self, limit: int = 100) -> Sequence[Entity]:
+        """Entities created from ambiguous mentions, for deliberate review."""
+        ...
+
+    async def add_aliases(self, entity_id: EntityId, aliases: Sequence[str]) -> None: ...
+
+    async def merge(
+        self,
+        keep: EntityId,
+        absorb: EntityId,
+        reason: str,
+        merged_at: datetime,
+    ) -> None:
+        """Point one entity at another.
+
+        Records rather than destroys: the absorbed row is retained with
+        `merged_into` set, so the operation stays reversible. ADR-014 makes merging
+        an explicit act precisely because a wrong merge is invisible corruption.
+        """
+        ...
+
+    async def count(self) -> int: ...
+
+
+class MemoryRepositoryPort(Protocol):
+    """Facts, events, and relationships.
+
+    Unit 2 scope is insertion and reading. The evolution semantics — correction,
+    supersession, retraction, belief transitions — are Unit 3.
+    """
+
+    async def insert_fact(self, fact: Fact, salience_category: str | None) -> Fact: ...
+
+    async def insert_event(self, event: Event, salience_category: str | None) -> Event: ...
+
+    async def insert_relationship(self, relationship: Relationship) -> Relationship: ...
+
+    async def get_fact(self, memory_id: MemoryId) -> Fact | None: ...
+
+    async def active_facts(self, limit: int = 100) -> Sequence[Fact]:
+        """Currently believed, not superseded, highest salience first."""
+        ...
+
+    async def facts_for_entity(self, entity_id: EntityId, limit: int = 50) -> Sequence[Fact]: ...
+
+    async def relationships_for_entity(
+        self, entity_id: EntityId
+    ) -> Sequence[Relationship]: ...
+
+    async def count_facts(self) -> int: ...
+
+
+class ProvenanceRepositoryPort(Protocol):
+    """The many-to-many link from derived memory back to source episodes.
+
+    Many-to-many is required by ADR-012's corroboration rule: a fact supported by
+    three conversations must survive deletion of one, and only be retracted when the
+    last supporting source is gone.
+    """
+
+    async def record(
+        self,
+        memory_id: MemoryId,
+        memory_kind: MemoryKind,
+        ref: ProvenanceRef,
+        recorded_at: datetime,
+    ) -> None: ...
+
+    async def for_memory(
+        self, memory_id: MemoryId, memory_kind: MemoryKind
+    ) -> Sequence[ProvenanceRef]: ...
+
+    async def count_for_memory(self, memory_id: MemoryId, memory_kind: MemoryKind) -> int:
+        """Remaining supporting sources. The corroboration rule reads this."""
+        ...
+
+    async def memories_from_episode(
+        self, episode_id: EpisodeId
+    ) -> Sequence[tuple[MemoryId, MemoryKind]]: ...
 
 
 class EpisodeRepositoryPort(Protocol):

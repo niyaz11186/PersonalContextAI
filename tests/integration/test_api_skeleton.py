@@ -28,17 +28,45 @@ from pca.main import create_app
 from pca.orchestration.conversation_workflow import ConversationWorkflow
 from pca.services.context_assembly import ContextAssemblyService
 from pca.services.conversation import ConversationService
+from pca.services.entities import EntityService
 from pca.services.episodes import EpisodeService
-from pca.services.extraction import ExtractionService
+from pca.services.extraction import ExtractedFact, ExtractionPayload, ExtractionService
+from pca.services.memory import MemoryService
+from pca.services.provenance import ProvenanceService
 from pca.services.retrieval import RetrievalService
+from pca.services.salience import SalienceScorer
 from pca.services.time_resolver import TimeResolver
 from tests.fakes.clock import FakeClock
 from tests.fakes.graph import FakeMemoryGraph
 from tests.fakes.llm import FakeLLMProvider
+from tests.fakes.memory_repositories import (
+    FakeEntityRepository,
+    FakeMemoryRepository,
+    FakeProvenanceRepository,
+)
 from tests.fakes.repositories import FakeConversationRepository, FakeEpisodeRepository
 from tests.fakes.store import FakeRelationalStore
 
 REPLY = "Yes, you mentioned Priya lives in Pune."
+
+
+def extraction_payload() -> ExtractionPayload:
+    """Scripted extraction result.
+
+    Needed because the message flow now runs extraction and commit after the reply.
+    Without a scripted payload the fake provider would raise and every test would
+    exercise the failure path instead of the happy one.
+    """
+    return ExtractionPayload(
+        facts=[
+            ExtractedFact(
+                statement="Priya lives in Pune",
+                origin="user_stated",
+                category="location",
+                about=["Priya"],
+            )
+        ]
+    )
 
 
 class _StubProviderHealth:
@@ -59,12 +87,32 @@ def build_fake_container(
     clock = FakeClock(zone="Asia/Kolkata")
     store = FakeRelationalStore()
     graph = graph or FakeMemoryGraph()
-    provider = provider or FakeLLMProvider(completions=[REPLY])
+    provider = provider or FakeLLMProvider(
+        completions=[REPLY],
+        # One payload per message the test sends; a generous supply keeps the
+        # scripting out of individual tests.
+        structured_results=[extraction_payload() for _ in range(10)],
+    )
 
     conversation_repository = FakeConversationRepository()
     episode_repository = FakeEpisodeRepository()
+    entity_repository = FakeEntityRepository()
+    memory_repository = FakeMemoryRepository()
+    provenance_repository = FakeProvenanceRepository()
 
     conversations = ConversationService(repository=conversation_repository, clock=clock)
+    entities = EntityService(repository=entity_repository, clock=clock)
+    provenance = ProvenanceService(
+        repository=provenance_repository,
+        conversations=conversation_repository,
+        clock=clock,
+    )
+    memory = MemoryService(
+        repository=memory_repository,
+        entities=entities,
+        provenance=provenance,
+        clock=clock,
+    )
     episodes = EpisodeService(
         repository=episode_repository,
         graph=graph,
@@ -75,7 +123,7 @@ def build_fake_container(
     retrieval = RetrievalService(graph=graph)
     assembly = ContextAssemblyService()
 
-    return Container(
+    container = Container(
         settings=settings,
         clock=clock,  # type: ignore[arg-type]
         store=store,  # type: ignore[arg-type]
@@ -84,7 +132,11 @@ def build_fake_container(
         migrations=MigrationRunner(store, clock, Path("migrations")),  # type: ignore[arg-type]
         conversations=conversations,
         episodes=episodes,
-        extraction=ExtractionService(provider=provider, resolver=TimeResolver()),  # type: ignore[arg-type]
+        extraction=ExtractionService(
+            provider=provider,  # type: ignore[arg-type]
+            resolver=TimeResolver(),
+            salience=SalienceScorer(),
+        ),
         retrieval=retrieval,
         assembly=assembly,
         conversation_workflow=ConversationWorkflow(
@@ -93,7 +145,17 @@ def build_fake_container(
             assembly=assembly,
             provider=provider,  # type: ignore[arg-type]
         ),
+        entities=entities,
+        provenance=provenance,
+        memory=memory,
     )
+
+    # Test scaffolding: expose the fakes so assertions can inspect what was actually
+    # written. Container is a plain dataclass, so extra attributes are permitted.
+    container.test_memory_repo = memory_repository  # type: ignore[attr-defined]
+    container.test_entity_repo = entity_repository  # type: ignore[attr-defined]
+    container.test_provenance_repo = provenance_repository  # type: ignore[attr-defined]
+    return container
 
 
 @pytest.fixture
@@ -343,8 +405,13 @@ def test_graph_failure_degrades_with_disclosure_rather_than_failing() -> None:
         assert events[-1]["done"] is True
 
         # The degradation must reach the prompt, not just the logs.
-        rendered = container.provider.calls[-1][1]  # type: ignore[attr-defined]
-        prompt_text = " ".join(m.content for m in rendered.messages)
+        #
+        # Specifically the *stream* call. Extraction now runs after generation, so
+        # the most recent provider call is the extraction request and asserting on
+        # calls[-1] would inspect the wrong prompt entirely.
+        stream_calls = [c for c in container.provider.calls if c[0] == "stream"]  # type: ignore[attr-defined]
+        assert stream_calls, "expected a streaming generation call"
+        prompt_text = " ".join(m.content for m in stream_calls[-1][1].messages)
         assert "could not be searched" in prompt_text
 
 
@@ -374,3 +441,137 @@ def test_provider_failure_reports_an_error_event_and_keeps_the_message() -> None
         history = client.get(f"/conversations/{conversation_id}/messages").json()
         assert history[0]["content"] == "important fact"
         assert len(history) == 1, "no assistant message for a failed reply"
+
+
+# ===========================================================================
+# Unit 2 — the memory write path, end to end through the API
+# ===========================================================================
+
+
+def test_sending_a_message_commits_facts_and_entities(
+    container: Container, client: TestClient
+) -> None:
+    """The whole point of Unit 2, asserted end to end.
+
+    Unit 1b stored episodes in the graph but wrote nothing to PostgreSQL's memory
+    model. This is the test that would have caught that: it asserts the authoritative
+    store actually received facts and entities, not just that the request returned 200.
+    """
+    conversation_id = client.post("/conversations", json={}).json()["id"]
+
+    client.post(
+        f"/conversations/{conversation_id}/messages",
+        json={"content": "My sister Priya lives in Pune."},
+    )
+
+    facts = container.test_memory_repo.facts  # type: ignore[attr-defined]
+    entities = container.test_entity_repo.entities  # type: ignore[attr-defined]
+
+    assert len(facts) == 1
+    assert next(iter(facts.values())).statement == "Priya lives in Pune"
+    assert len(entities) == 1
+    assert next(iter(entities.values())).name == "Priya"
+
+
+def test_committed_facts_carry_provenance_to_the_source_message(
+    container: Container, client: TestClient
+) -> None:
+    """FR-02.5. A memory with no traceable source cannot be justified to the user."""
+    conversation_id = client.post("/conversations", json={}).json()["id"]
+
+    client.post(
+        f"/conversations/{conversation_id}/messages",
+        json={"content": "My sister Priya lives in Pune."},
+    )
+
+    rows = container.test_provenance_repo.rows  # type: ignore[attr-defined]
+    assert rows, "expected provenance to be recorded"
+    _, _, ref, _ = rows[0]
+    assert ref.message_id is not None
+    assert ref.conversation_id is not None
+
+
+def test_committed_fact_has_both_time_axes_populated(
+    container: Container, client: TestClient
+) -> None:
+    """Belief time always exists; world time only when a phrase resolved.
+
+    Sourcing both from the same value is how a temporal system starts answering
+    "what did I think in March" with "what was true in March".
+    """
+    conversation_id = client.post("/conversations", json={}).json()["id"]
+
+    client.post(
+        f"/conversations/{conversation_id}/messages",
+        json={"content": "My sister Priya lives in Pune."},
+    )
+
+    fact = next(iter(container.test_memory_repo.facts.values()))  # type: ignore[attr-defined]
+    assert fact.belief.asserted_at is not None
+    assert fact.belief.retracted_at is None
+    # The scripted payload carries no time phrase, so world time is legitimately
+    # absent rather than fabricated (ADR-010).
+    assert fact.validity.valid_from is None
+
+
+def test_ambiguous_entity_produces_a_user_facing_notice() -> None:
+    """ADR-014 ambiguity must reach the user, not just the logs.
+
+    A provisional entity means the fact may be attached to the wrong person until
+    someone decides. Silence there is how a graph quietly becomes wrong.
+    """
+    from uuid import uuid4
+
+    from pca.domain.enums import EntityType
+    from pca.domain.ids import EntityId
+    from pca.domain.memory import Entity
+
+    container = build_fake_container()
+    repo = container.test_entity_repo  # type: ignore[attr-defined]
+
+    # Two existing people share the name the scripted extraction will mention.
+    # Seeded directly into the fake's storage rather than through its async API,
+    # because this is a synchronous test and spinning up a second event loop to call
+    # one setup method is worse than reaching into a test double.
+    for _ in range(2):
+        entity_id = EntityId(uuid4())
+        repo.entities[entity_id] = Entity(
+            id=entity_id, name="Priya", entity_type=EntityType.PERSON
+        )
+        repo.aliases[entity_id] = set()
+
+    with make_client(container) as client:
+        conversation_id = client.post("/conversations", json={}).json()["id"]
+        response = client.post(
+            f"/conversations/{conversation_id}/messages",
+            json={"content": "Priya called me."},
+        )
+
+    events = sse_events(response.text)
+    assert events[-1]["done"] is True
+    assert "notices" in events[-1]
+    assert any("unambiguously" in n for n in events[-1]["notices"])
+
+
+def test_memory_write_failure_is_disclosed_and_does_not_lose_the_message() -> None:
+    """A broken memory write must be visible.
+
+    This is the lesson from the Unit 1b defect: the message stays durable, but the
+    user is told that it did not reach memory rather than being left to assume it did.
+    """
+    provider = FakeLLMProvider(completions=[REPLY], structured_results=[])
+    container = build_fake_container(provider=provider)
+
+    with make_client(container) as client:
+        conversation_id = client.post("/conversations", json={}).json()["id"]
+        response = client.post(
+            f"/conversations/{conversation_id}/messages",
+            json={"content": "Something important"},
+        )
+
+        events = sse_events(response.text)
+        assert "notices" in events[-1]
+        assert any("could not be added to memory" in n for n in events[-1]["notices"])
+
+        history = client.get(f"/conversations/{conversation_id}/messages").json()
+        assert history[0]["content"] == "Something important"

@@ -11,7 +11,7 @@ ends up holding two unrelated facts that quietly disagree (specification §6).
 
 from dataclasses import dataclass, field
 
-from pca.domain.enums import Confidence, EntityType, Origin
+from pca.domain.enums import Confidence, EntityType, Origin, SalienceCategory
 from pca.domain.ids import EpisodeId
 from pca.domain.temporal import OrderingConstraint, TemporalExpression
 
@@ -29,6 +29,7 @@ class CandidateFact:
     origin: Origin
     confidence: Confidence = Confidence.PROBABLE
     salience: float = 0.0
+    salience_category: SalienceCategory | None = None
     subject_names: list[str] = field(default_factory=list)
     """Entity *names* rather than ids — resolution to ids happens later, and
     ADR-014 forbids resolving ambiguous mentions silently."""
@@ -42,6 +43,7 @@ class CandidateEvent:
     participant_names: list[str] = field(default_factory=list)
     temporal_expression: TemporalExpression | None = None
     salience: float = 0.0
+    salience_category: SalienceCategory | None = None
 
 
 @dataclass(frozen=True, slots=True)

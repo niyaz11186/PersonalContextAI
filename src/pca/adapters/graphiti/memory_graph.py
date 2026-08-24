@@ -57,11 +57,16 @@ from graphiti_core.llm_client.gemini_client import GeminiClient  # noqa: E402
 from graphiti_core.nodes import EpisodeType  # noqa: E402
 from neo4j import AsyncGraphDatabase  # noqa: E402
 
-from pca.domain.conversation import Episode
-from pca.domain.errors import MemoryGraphUnavailable
-from pca.domain.ids import EntityId
-from pca.observability.logging import get_logger
-from pca.ports.graph import EntityDivergence, GraphHit, GraphIngestResult
+from pca.adapters.graphiti.entity_types import GRAPHITI_ENTITY_TYPES  # noqa: E402
+from pca.domain.conversation import Episode  # noqa: E402
+from pca.domain.errors import MemoryGraphUnavailable  # noqa: E402
+from pca.domain.ids import EntityId  # noqa: E402
+from pca.observability.logging import get_logger  # noqa: E402
+from pca.ports.graph import (  # noqa: E402
+    EntityDivergence,
+    GraphHit,
+    GraphIngestResult,
+)
 
 _log = get_logger(__name__)
 
@@ -208,6 +213,10 @@ class GraphitiMemoryAdapter:
                 ),
                 reference_time=episode.occurred_at,
                 source=EpisodeType.message if episode.message_id else EpisodeType.text,
+                # ADR-015: prescribe the ontology rather than letting Graphiti infer
+                # categories freely, so its graph stays legible against our own
+                # EntityType and divergence stays small.
+                entity_types=GRAPHITI_ENTITY_TYPES,
             )
         except Exception as exc:  # noqa: BLE001
             raise MemoryGraphUnavailable(f"episode ingestion failed: {exc}") from exc

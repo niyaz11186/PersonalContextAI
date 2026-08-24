@@ -27,6 +27,11 @@ from pca.adapters.gemini.provider import GeminiProviderAdapter
 from pca.adapters.graphiti.memory_graph import GraphitiMemoryAdapter
 from pca.adapters.postgres.conversation_repository import PostgresConversationRepository
 from pca.adapters.postgres.episode_repository import PostgresEpisodeRepository
+from pca.adapters.postgres.memory_repositories import (
+    PostgresEntityRepository,
+    PostgresMemoryRepository,
+    PostgresProvenanceRepository,
+)
 from pca.adapters.postgres.store import PostgresStoreAdapter
 from pca.config.migrations import MigrationRunner
 from pca.config.settings import Settings, get_settings
@@ -34,9 +39,13 @@ from pca.observability.logging import configure_logging, get_logger
 from pca.orchestration.conversation_workflow import ConversationWorkflow
 from pca.services.context_assembly import ContextAssemblyService
 from pca.services.conversation import ConversationService
+from pca.services.entities import EntityService
 from pca.services.episodes import EpisodeService
 from pca.services.extraction import ExtractionService
+from pca.services.memory import MemoryService
+from pca.services.provenance import ProvenanceService
 from pca.services.retrieval import RetrievalService
+from pca.services.salience import SalienceScorer
 from pca.services.time_resolver import TimeResolver
 
 _log = get_logger(__name__)
@@ -58,12 +67,21 @@ class Container:
     retrieval: RetrievalService
     assembly: ContextAssemblyService
     conversation_workflow: ConversationWorkflow
+    entities: EntityService
+    provenance: ProvenanceService
+    memory: MemoryService
 
 
 def build_container(settings: Settings | None = None) -> Container:
     """Wire everything. Performs no I/O — see `start` for that."""
     settings = settings or get_settings()
     configure_logging(settings.log_level)
+
+    # Validate secrets before constructing any adapter. The Gemini clients are built
+    # eagerly, and without this the failure surfaces as an opaque ValueError from
+    # deep inside the Google SDK ("No API key was provided") rather than as a clear
+    # statement of which configuration value is missing.
+    settings.require_runtime_secrets()
 
     clock = SystemClockAdapter(zone=settings.user_timezone)
     store = PostgresStoreAdapter(dsn=settings.postgres_dsn)
@@ -87,8 +105,24 @@ def build_container(settings: Settings | None = None) -> Container:
 
     conversation_repository = PostgresConversationRepository(store)
     episode_repository = PostgresEpisodeRepository(store, clock)
+    entity_repository = PostgresEntityRepository(store)
+    memory_repository = PostgresMemoryRepository(store)
+    provenance_repository = PostgresProvenanceRepository(store)
 
     conversations = ConversationService(repository=conversation_repository, clock=clock)
+
+    entities = EntityService(repository=entity_repository, clock=clock)
+    provenance = ProvenanceService(
+        repository=provenance_repository,
+        conversations=conversation_repository,
+        clock=clock,
+    )
+    memory = MemoryService(
+        repository=memory_repository,
+        entities=entities,
+        provenance=provenance,
+        clock=clock,
+    )
     episodes = EpisodeService(
         repository=episode_repository,
         graph=graph,
@@ -99,6 +133,7 @@ def build_container(settings: Settings | None = None) -> Container:
     extraction = ExtractionService(
         provider=provider,
         resolver=TimeResolver(),
+        salience=SalienceScorer(),
         model=settings.llm_model,
     )
     retrieval = RetrievalService(graph=graph)
@@ -125,6 +160,9 @@ def build_container(settings: Settings | None = None) -> Container:
         retrieval=retrieval,
         assembly=assembly,
         conversation_workflow=workflow,
+        entities=entities,
+        provenance=provenance,
+        memory=memory,
     )
 
 

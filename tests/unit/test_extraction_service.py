@@ -59,7 +59,7 @@ async def test_clock_relative_reference_is_resolved_to_dates() -> None:
             ExtractedFact(
                 statement="Argued with Priya",
                 origin="user_stated",
-                people=["Priya"],
+                about=["Priya"],
                 time_reference=TimeReference(
                     raw_phrase="last Tuesday",
                     kind="clock_relative",
@@ -273,3 +273,241 @@ async def test_granularity_matches_the_phrase_precision(
     candidates = await service(payload).extract(episode())
 
     assert candidates.facts[0].temporal_expression.granularity is expected_granularity
+
+
+# ===========================================================================
+# Unit 2 — full extraction: entities, events, relationships, salience
+# ===========================================================================
+
+
+def full_service(payload: ExtractionPayload) -> ExtractionService:
+    from pca.services.salience import SalienceScorer
+
+    return ExtractionService(
+        provider=FakeLLMProvider(structured_results=[payload]),
+        resolver=TimeResolver(),
+        salience=SalienceScorer(),
+    )
+
+
+async def test_entities_are_extracted_with_types() -> None:
+    from pca.domain.enums import EntityType
+    from pca.services.extraction import ExtractedEntity
+
+    payload = ExtractionPayload(
+        entities=[
+            ExtractedEntity(name="Suresh", entity_type="person"),
+            ExtractedEntity(name="Google", entity_type="organization"),
+            ExtractedEntity(name="Visakhapatnam", entity_type="place"),
+        ]
+    )
+
+    candidates = await full_service(payload).extract(episode())
+
+    by_name = {e.name: e.entity_type for e in candidates.entities}
+    assert by_name["Suresh"] is EntityType.PERSON
+    assert by_name["Google"] is EntityType.ORGANIZATION
+    assert by_name["Visakhapatnam"] is EntityType.PLACE
+
+
+async def test_relationships_are_extracted_and_normalised() -> None:
+    """Relation types are normalised to lower_snake_case so "Works At" and
+    "works_at" do not become two distinct relation kinds in the graph."""
+    from pca.services.extraction import ExtractedRelationship
+
+    payload = ExtractionPayload(
+        relationships=[
+            ExtractedRelationship(
+                from_entity="me",
+                to_entity="Suresh",
+                relation_type="Close Friend",
+                origin="user_stated",
+            )
+        ]
+    )
+
+    candidates = await full_service(payload).extract(episode())
+
+    assert candidates.relationships[0].relation_type == "close_friend"
+
+
+async def test_self_referential_relationship_is_dropped() -> None:
+    """It is meaningless and would violate a database constraint, so it is dropped
+    here rather than failing the whole commit later."""
+    from pca.services.extraction import ExtractedRelationship
+
+    payload = ExtractionPayload(
+        relationships=[
+            ExtractedRelationship(
+                from_entity="Suresh",
+                to_entity="suresh",
+                relation_type="knows",
+                origin="ai_inferred",
+            )
+        ]
+    )
+
+    candidates = await full_service(payload).extract(episode())
+
+    assert candidates.relationships == []
+
+
+async def test_events_are_extracted_with_participants_and_time() -> None:
+    from pca.services.extraction import ExtractedEvent
+
+    payload = ExtractionPayload(
+        events=[
+            ExtractedEvent(
+                description="Argued about the house",
+                origin="user_stated",
+                category="significant_event",
+                participants=["Priya"],
+                time_reference=TimeReference(
+                    raw_phrase="last Tuesday",
+                    kind="clock_relative",
+                    direction="past",
+                    weekday=1,
+                    modifier="last",
+                ),
+            )
+        ]
+    )
+
+    candidates = await full_service(payload).extract(episode())
+    event = candidates.events[0]
+
+    assert event.participant_names == ["Priya"]
+    assert event.temporal_expression.granularity is Granularity.DAY
+    assert event.salience > 0.5
+
+
+async def test_significant_events_score_higher_than_transient_detail() -> None:
+    """The ADR-017 property that stops trivia burying signal."""
+    payload = ExtractionPayload(
+        facts=[
+            ExtractedFact(
+                statement="My sister got divorced",
+                origin="user_stated",
+                category="significant_event",
+                about=["sister"],
+            ),
+            ExtractedFact(
+                statement="I had toast",
+                origin="user_stated",
+                category="transient",
+            ),
+        ]
+    )
+
+    candidates = await full_service(payload).extract(episode())
+    scores = {f.statement: f.salience for f in candidates.facts}
+
+    assert scores["My sister got divorced"] > scores["I had toast"]
+
+
+async def test_salience_category_is_carried_onto_the_candidate() -> None:
+    """Persisted alongside the score so a future re-tuning can recompute rather than
+    having to re-extract everything."""
+    from pca.domain.enums import SalienceCategory
+
+    payload = ExtractionPayload(
+        facts=[
+            ExtractedFact(
+                statement="Suresh is a frontend developer",
+                origin="user_stated",
+                category="identity",
+            )
+        ]
+    )
+
+    candidates = await full_service(payload).extract(episode())
+
+    assert candidates.facts[0].salience_category is SalienceCategory.IDENTITY
+
+
+async def test_inferred_facts_score_below_stated_ones() -> None:
+    payload = ExtractionPayload(
+        facts=[
+            ExtractedFact(
+                statement="Suresh lives in Visakhapatnam",
+                origin="user_stated",
+                category="location",
+            ),
+            ExtractedFact(
+                statement="Suresh probably enjoys the coast",
+                origin="ai_inferred",
+                category="location",
+                confidence="uncertain",
+            ),
+        ]
+    )
+
+    candidates = await full_service(payload).extract(episode())
+    scores = {f.statement: f.salience for f in candidates.facts}
+
+    assert (
+        scores["Suresh lives in Visakhapatnam"]
+        > scores["Suresh probably enjoys the coast"]
+    )
+
+
+async def test_compound_statement_yields_separate_records() -> None:
+    """The Unit 1b observation that motivated Unit 2.
+
+    "My friend Suresh is a frontend developer in Visakhapatnam" carries a
+    relationship, an occupation, and a location. Unit 1b's naive extraction captured
+    only the location. All three must survive as separate records.
+    """
+    from pca.services.extraction import ExtractedEntity, ExtractedRelationship
+
+    payload = ExtractionPayload(
+        entities=[
+            ExtractedEntity(name="Suresh", entity_type="person"),
+            ExtractedEntity(name="Visakhapatnam", entity_type="place"),
+        ],
+        facts=[
+            ExtractedFact(
+                statement="Suresh is a frontend developer",
+                origin="user_stated",
+                category="identity",
+                about=["Suresh"],
+            ),
+            ExtractedFact(
+                statement="Suresh lives in Visakhapatnam",
+                origin="user_stated",
+                category="location",
+                about=["Suresh", "Visakhapatnam"],
+            ),
+        ],
+        relationships=[
+            ExtractedRelationship(
+                from_entity="me",
+                to_entity="Suresh",
+                relation_type="friend",
+                origin="user_stated",
+            )
+        ],
+    )
+
+    candidates = await full_service(payload).extract(episode())
+
+    statements = {f.statement for f in candidates.facts}
+    assert "Suresh is a frontend developer" in statements
+    assert "Suresh lives in Visakhapatnam" in statements
+    assert candidates.relationships[0].relation_type == "friend"
+    assert candidates.total >= 5
+
+
+async def test_blank_entity_names_are_discarded() -> None:
+    from pca.services.extraction import ExtractedEntity
+
+    payload = ExtractionPayload(
+        entities=[
+            ExtractedEntity(name="  ", entity_type="person"),
+            ExtractedEntity(name="Suresh", entity_type="person"),
+        ]
+    )
+
+    candidates = await full_service(payload).extract(episode())
+
+    assert [e.name for e in candidates.entities] == ["Suresh"]
