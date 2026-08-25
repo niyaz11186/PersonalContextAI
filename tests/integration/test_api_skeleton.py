@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 
 from pca.composition import Container
 from pca.config.migrations import MigrationRunner
+from pca.config.schema_drift import SchemaDriftCheck
 from pca.config.settings import Settings
 from pca.main import create_app
 from pca.orchestration.conversation_workflow import ConversationWorkflow
@@ -130,6 +131,7 @@ def build_fake_container(
         graph=graph,  # type: ignore[arg-type]
         provider=provider,  # type: ignore[arg-type]
         migrations=MigrationRunner(store, clock, Path("migrations")),  # type: ignore[arg-type]
+        schema_drift=SchemaDriftCheck(store),  # type: ignore[arg-type]
         conversations=conversations,
         episodes=episodes,
         extraction=ExtractionService(

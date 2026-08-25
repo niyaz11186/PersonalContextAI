@@ -266,3 +266,131 @@ async def test_merging_a_missing_entity_is_rejected(service: EntityService) -> N
             EntityId(uuid4()),
             reason="no such entity",
         )
+
+
+# ===========================================================================
+# The self entity
+#
+# Found by a live test: a single message produced an entity literally named "user"
+# with type "other". Extraction refers to the speaker inconsistently — "user", "me",
+# "I", "myself" — and because those are *different names*, resolution takes the
+# CREATED branch each time without even flagging ambiguity.
+#
+# That is worse than the ambiguous-duplicate case ADR-014 handles: there is no signal
+# at all, and every relationship about the user silently fragments across variants.
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    "mention",
+    ["me", "I", "i", "myself", "user", "the user", "My", "mine", "self"],
+)
+async def test_first_person_mentions_all_resolve_to_one_entity(
+    service: EntityService, repository: FakeEntityRepository, mention: str
+) -> None:
+    first = await service.resolve_for_extraction("me")
+
+    second = await service.resolve_for_extraction(mention)
+
+    assert second.outcome is ResolutionOutcome.LINKED
+    assert second.entity.id == first.entity.id
+    assert await repository.count() == 1
+
+
+async def test_every_self_variant_in_one_batch_yields_a_single_entity(
+    service: EntityService, repository: FakeEntityRepository
+) -> None:
+    """The failure mode this prevents, exercised directly."""
+    await service.resolve_many(["me", "I", "user", "myself", "the user"])
+
+    assert await repository.count() == 1
+
+
+async def test_self_entity_is_typed_as_a_person(service: EntityService) -> None:
+    """Not OTHER, which is what the model produced live.
+
+    Typing the user as OTHER would exclude them from person-scoped queries — a poor
+    default for the one entity appearing in most relationships.
+    """
+    decision = await service.resolve_for_extraction("me")
+
+    assert decision.entity.entity_type is EntityType.PERSON
+    assert decision.entity.is_provisional is False
+
+
+async def test_self_entity_uses_a_canonical_name(service: EntityService) -> None:
+    decision = await service.resolve_for_extraction("I")
+
+    assert decision.entity.name == "the user"
+
+
+async def test_self_entity_carries_every_alias(
+    service: EntityService, repository: FakeEntityRepository
+) -> None:
+    """Seeded up front so a later lookup matches by alias even if the fast path is
+    bypassed."""
+    decision = await service.resolve_for_extraction("me")
+
+    aliases = repository.aliases[decision.entity.id]
+    assert {"me", "i", "user", "myself"} <= aliases
+
+
+async def test_an_existing_self_entity_is_adopted_rather_than_duplicated(
+    service: EntityService, repository: FakeEntityRepository
+) -> None:
+    """Handles data already written before canonicalisation existed.
+
+    A prior run created an entity literally named "user". A fresh mention must adopt
+    it rather than create a second self entity beside it.
+    """
+    legacy_id = EntityId(uuid4())
+    await repository.create(
+        entity_id=legacy_id,
+        name="user",
+        entity_type=EntityType.OTHER,
+        created_at=START,
+    )
+
+    decision = await service.resolve_for_extraction("me")
+
+    assert decision.entity.id == legacy_id
+    assert await repository.count() == 1
+    # And it gains the canonical alias set so future lookups converge.
+    assert "the user" in repository.aliases[legacy_id]
+
+
+async def test_a_real_person_is_not_confused_with_the_self_entity(
+    service: EntityService,
+) -> None:
+    self_decision = await service.resolve_for_extraction("me")
+    pradeep = await service.resolve_for_extraction("Pradeep")
+
+    assert pradeep.entity.id != self_decision.entity.id
+    assert pradeep.entity.name == "Pradeep"
+
+
+async def test_self_and_a_colleague_can_form_a_relationship(
+    service: EntityService,
+) -> None:
+    """The concrete case from the live test: "My Colleague Pradeep".
+
+    Both endpoints must resolve to distinct entities, or the relationship is dropped.
+    """
+    from pca.domain.ids import MemoryId
+    from pca.domain.memory import ProvenanceRef, Relationship
+    from pca.domain.enums import Origin
+    from pca.domain.ids import EpisodeId
+
+    me = await service.resolve_for_extraction("me")
+    colleague = await service.resolve_for_extraction("Pradeep")
+
+    relationship = Relationship(
+        id=MemoryId(uuid4()),
+        from_entity_id=me.entity.id,
+        to_entity_id=colleague.entity.id,
+        relation_type="colleague",
+        origin=Origin.USER_STATED,
+        provenance=[ProvenanceRef(episode_id=EpisodeId(uuid4()))],
+    )
+
+    assert relationship.from_entity_id != relationship.to_entity_id

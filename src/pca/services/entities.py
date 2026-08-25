@@ -49,6 +49,43 @@ SCORE_ALIAS = 0.90
 
 LINK_THRESHOLD = 0.85
 
+# --------------------------------------------------------------------------
+# The self entity.
+#
+# The user is the single most important entity in a personal-context system —
+# almost every relationship radiates from them. But extraction refers to them
+# inconsistently: "user" on one message, "me" on another, "I" on a third.
+#
+# Without canonicalisation each variant is a *different name*, so resolution takes
+# the CREATED branch every time and never even flags ambiguity. The result is a
+# silent fan-out of self-duplicates, and every relationship about the user is split
+# across them. That is worse than the ambiguous-duplicate case ADR-014 addresses,
+# because there is no signal at all.
+#
+# Observed live: a single message produced an entity literally named "user" with
+# type "other".
+# --------------------------------------------------------------------------
+SELF_ENTITY_NAME = "the user"
+
+SELF_ALIASES: frozenset[str] = frozenset(
+    {
+        "the user",
+        "user",
+        "me",
+        "i",
+        "myself",
+        "my",
+        "mine",
+        "self",
+        "the speaker",
+        "narrator",
+    }
+)
+
+
+def is_self_mention(mention: str) -> bool:
+    return mention.strip().casefold() in SELF_ALIASES
+
 
 class EntityService:
     def __init__(self, repository: EntityRepositoryPort, clock: ClockPort) -> None:
@@ -67,6 +104,18 @@ class EntityService:
         mention = mention.strip()
         if not mention:
             raise ValueError("cannot resolve an empty mention")
+
+        # First-person mentions collapse onto one canonical entity before any name
+        # matching happens. Otherwise "me" and "user" are simply different names and
+        # each creates its own entity, fragmenting every relationship about the user.
+        if is_self_mention(mention):
+            entity = await self.resolve_self()
+            _log.info("self_mention_linked", mention=mention, entity_id=str(entity.id))
+            return ResolutionDecision(
+                outcome=ResolutionOutcome.LINKED,
+                entity=entity,
+                considered=[EntityMatch(entity=entity, score=SCORE_EXACT)],
+            )
 
         candidates = await self._score_candidates(mention)
         strong = [c for c in candidates if c.score >= LINK_THRESHOLD]
@@ -113,6 +162,47 @@ class EntityService:
             entity=created,
             considered=candidates,
         )
+
+    async def resolve_self(self) -> Entity:
+        """Find or create the canonical entity representing the user.
+
+        Seeded with every first-person alias so that a later mention of any of them
+        matches by alias even if this method is bypassed.
+
+        Typed PERSON, not OTHER. The user is a person, and typing them otherwise
+        would exclude them from person-scoped queries — which, for the one entity
+        that appears in most relationships, is a bad default.
+        """
+        existing = await self._repository.find_by_name(SELF_ENTITY_NAME)
+        if existing:
+            return existing[0]
+
+        # A prior mention may have created the self entity under a different alias.
+        for alias in sorted(SELF_ALIASES):
+            found = await self._repository.find_by_name(alias)
+            if found:
+                # Adopt it: give it the canonical name's alias set so subsequent
+                # lookups converge rather than continuing to diverge.
+                await self._repository.add_aliases(
+                    found[0].id, sorted(SELF_ALIASES)
+                )
+                _log.info(
+                    "self_entity_adopted_existing",
+                    entity_id=str(found[0].id),
+                    matched_alias=alias,
+                )
+                return found[0]
+
+        created = await self._repository.create(
+            entity_id=EntityId(uuid4()),
+            name=SELF_ENTITY_NAME,
+            entity_type=EntityType.PERSON,
+            created_at=self._clock.now(),
+            is_provisional=False,
+            aliases=sorted(SELF_ALIASES),
+        )
+        _log.info("self_entity_created", entity_id=str(created.id))
+        return created
 
     async def resolve_many(
         self, mentions: Sequence[str], entity_type: EntityType = EntityType.PERSON

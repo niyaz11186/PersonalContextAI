@@ -1,0 +1,8 @@
+﻿neo4j version: 6.2.0
+--- loggers that exist after import ---
+   neo4j
+   neo4j.auth_management
+   neo4j.io
+   neo4j.notifications
+   neo4j.pool
+   neo4j.session

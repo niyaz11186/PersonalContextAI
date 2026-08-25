@@ -43,7 +43,11 @@ from pca.domain.memory import (
     Relationship,
 )
 from pca.domain.temporal import BeliefWindow, TemporalExpression, TemporalValidity
+from pca.observability.logging import get_logger
+from pca.ports.clock import ClockPort
 from pca.ports.store import RelationalStorePort
+
+_log = get_logger(__name__)
 
 
 def _temporal_expression(row: Any) -> TemporalExpression | None:
@@ -262,8 +266,17 @@ class PostgresEntityRepository:
 
 
 class PostgresMemoryRepository:
-    def __init__(self, store: RelationalStorePort) -> None:
+    """Facts, events, and relationships.
+
+    Takes a ClockPort because `created_at` is NOT NULL on all three tables and means
+    "when this row was written" — which is not derivable from the domain objects.
+    Deriving it from a temporal field, as an earlier version did, produced NULL for
+    any record without a resolved date and would have failed every insert.
+    """
+
+    def __init__(self, store: RelationalStorePort, clock: ClockPort) -> None:
         self._store = store
+        self._clock = clock
 
     async def insert_fact(self, fact: Fact, salience_category: str | None) -> Fact:
         expression = fact.temporal_expression
@@ -287,7 +300,7 @@ class PostgresMemoryRepository:
                     temporal_method=expression.method.value if expression else None,
                     temporal_anchor_zone=expression.anchor_zone if expression else None,
                     superseded_by=fact.superseded_by,
-                    created_at=fact.belief.asserted_at,
+                    created_at=self._clock.now(),
                 )
             )
             for entity_id in fact.subject_entity_ids:
@@ -314,9 +327,7 @@ class PostgresMemoryRepository:
                     ),
                     temporal_method=expression.method.value if expression else None,
                     temporal_anchor_zone=expression.anchor_zone if expression else None,
-                    created_at=event.occurred_at or expression.resolved_from
-                    if expression
-                    else None,
+                    created_at=self._clock.now(),
                 )
             )
             for entity_id in event.participant_entity_ids:
@@ -337,7 +348,7 @@ class PostgresMemoryRepository:
                 origin=relationship.origin.value,
                 valid_from=relationship.validity.valid_from,
                 valid_to=relationship.validity.valid_to,
-                created_at=relationship.validity.valid_from,
+                created_at=self._clock.now(),
             )
         )
         return relationship
@@ -358,7 +369,9 @@ class PostgresMemoryRepository:
             .order_by(facts.c.salience.desc(), facts.c.created_at.desc())
             .limit(limit)
         )
-        return [await self._hydrate_fact(row) for row in rows]
+        # Batched hydration: one provenance query and one subjects query for the whole
+        # page, rather than two per fact.
+        return await self._hydrate_facts(rows)
 
     async def facts_for_entity(
         self, entity_id: EntityId, limit: int = 50
@@ -380,7 +393,7 @@ class PostgresMemoryRepository:
             .order_by(facts.c.salience.desc())
             .limit(limit)
         )
-        return [await self._hydrate_fact(row) for row in rows]
+        return await self._hydrate_facts(rows)
 
     async def relationships_for_entity(
         self, entity_id: EntityId
@@ -415,30 +428,98 @@ class PostgresMemoryRepository:
         row = await self._store.fetch_one(select(func.count()).select_from(facts))
         return int(next(iter(row.values()))) if row else 0
 
-    async def _hydrate_fact(self, row: Any) -> Fact:
-        subjects = await self._store.fetch_all(
-            select(fact_subjects.c.entity_id).where(fact_subjects.c.fact_id == row["id"])
+    async def _load_provenance(
+        self, fact_ids: Sequence[MemoryId]
+    ) -> dict[MemoryId, list[ProvenanceRef]]:
+        """Batch-load provenance for a set of facts.
+
+        One query for the whole set rather than one per fact. An earlier version
+        skipped this and synthesised a placeholder reference pointing at the fact's
+        own id as though it were an episode id — a fabrication that would have made
+        `fact.provenance` actively misleading, in exactly the area (traceability)
+        where the product's credibility rests.
+        """
+        if not fact_ids:
+            return {}
+
+        rows = await self._store.fetch_all(
+            select(provenance_index).where(
+                and_(
+                    provenance_index.c.memory_id.in_(list(fact_ids)),
+                    provenance_index.c.memory_kind == MemoryKind.FACT.value,
+                )
+            )
         )
-        return Fact(
-            id=MemoryId(row["id"]),
-            statement=row["statement"],
-            origin=Origin(row["origin"]),
-            confidence=Confidence(row["confidence"]),
-            validity=TemporalValidity(
-                valid_from=row["valid_from"], valid_to=row["valid_to"]
-            ),
-            belief=BeliefWindow(
-                asserted_at=row["asserted_at"], retracted_at=row["retracted_at"]
-            ),
-            # Provenance is loaded separately by ProvenanceService when needed. A
-            # placeholder is used because Fact requires at least one reference, and
-            # eagerly joining provenance on every fact read would be wasteful.
-            provenance=[ProvenanceRef(episode_id=EpisodeId(row["id"]))],
-            salience=float(row["salience"]),
-            subject_entity_ids=[EntityId(s["entity_id"]) for s in subjects],
-            temporal_expression=_temporal_expression(row),
-            superseded_by=MemoryId(row["superseded_by"]) if row["superseded_by"] else None,
+        found: dict[MemoryId, list[ProvenanceRef]] = {}
+        for row in rows:
+            found.setdefault(MemoryId(row["memory_id"]), []).append(
+                ProvenanceRef(
+                    episode_id=EpisodeId(row["episode_id"]),
+                    conversation_id=row["conversation_id"],
+                    message_id=row["message_id"],
+                    document_id=row["document_id"],
+                )
+            )
+        return found
+
+    async def _hydrate_facts(self, rows: Sequence[Any]) -> list[Fact]:
+        if not rows:
+            return []
+
+        ids = [MemoryId(row["id"]) for row in rows]
+        provenance = await self._load_provenance(ids)
+
+        subject_rows = await self._store.fetch_all(
+            select(fact_subjects).where(fact_subjects.c.fact_id.in_(ids))
         )
+        subjects: dict[MemoryId, list[EntityId]] = {}
+        for row in subject_rows:
+            subjects.setdefault(MemoryId(row["fact_id"]), []).append(
+                EntityId(row["entity_id"])
+            )
+
+        hydrated: list[Fact] = []
+        for row in rows:
+            fact_id = MemoryId(row["id"])
+            refs = provenance.get(fact_id, [])
+            if not refs:
+                # A fact with no provenance row should be impossible: commit writes
+                # both. If it happens, the record is untrustworthy rather than merely
+                # incomplete, so it is skipped loudly instead of being returned with
+                # invented traceability.
+                _log.error(
+                    "fact_without_provenance_skipped",
+                    fact_id=str(fact_id),
+                    consequence="record excluded from results; investigate the commit path",
+                )
+                continue
+
+            hydrated.append(
+                Fact(
+                    id=fact_id,
+                    statement=row["statement"],
+                    origin=Origin(row["origin"]),
+                    confidence=Confidence(row["confidence"]),
+                    validity=TemporalValidity(
+                        valid_from=row["valid_from"], valid_to=row["valid_to"]
+                    ),
+                    belief=BeliefWindow(
+                        asserted_at=row["asserted_at"], retracted_at=row["retracted_at"]
+                    ),
+                    provenance=refs,
+                    salience=float(row["salience"]),
+                    subject_entity_ids=subjects.get(fact_id, []),
+                    temporal_expression=_temporal_expression(row),
+                    superseded_by=(
+                        MemoryId(row["superseded_by"]) if row["superseded_by"] else None
+                    ),
+                )
+            )
+        return hydrated
+
+    async def _hydrate_fact(self, row: Any) -> Fact | None:
+        hydrated = await self._hydrate_facts([row])
+        return hydrated[0] if hydrated else None
 
 
 class PostgresProvenanceRepository:

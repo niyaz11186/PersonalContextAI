@@ -803,3 +803,184 @@ resolution — ADR-014's policy is Unit 2 work.
 
 Inception complete. Units 1a and 1b complete. Walking skeleton live and answering
 from memory. Five units remain: 2, 3, 4, 5, 6, 7, plus Build and Test.
+
+## 2026-08-24 - AUDIT: pre-activation review of Unit 2
+
+User requested an audit before activating Unit 2. Four real defects found, three of
+which would have broken the activation test.
+
+### Finding 1 — CRITICAL: every relationship insert would have failed
+
+`PostgresMemoryRepository.insert_relationship` set:
+
+```python
+created_at=relationship.validity.valid_from
+```
+
+`validity` defaults to an empty `TemporalValidity`, so `valid_from` is `None` for
+every relationship extraction produces. `relationships.created_at` is `NOT NULL`.
+
+**Consequence:** every relationship insert would have raised. That is precisely the
+capability Unit 2 exists to add — the "friend" relationship Unit 1b failed to capture
+would have failed again, for an entirely different and much more confusing reason.
+
+### Finding 2 — `insert_event` had the same defect, plus a precedence bug
+
+```python
+created_at=event.occurred_at or expression.resolved_from
+if expression
+else None,
+```
+
+Parses as `(event.occurred_at or expression.resolved_from) if expression else None`.
+Any event without a time phrase bound `None` to a `NOT NULL` column.
+
+**Fix for both:** `PostgresMemoryRepository` now takes a `ClockPort` and uses
+`clock.now()` for `created_at` on all three inserts. `created_at` means "when this row
+was written", which is not derivable from a domain object's temporal fields — deriving
+it from one was the error.
+
+### Finding 3 — hydrated facts carried fabricated provenance
+
+`_hydrate_fact` synthesised `ProvenanceRef(episode_id=EpisodeId(row["id"]))`, using the
+fact's own id as though it were an episode id, because `Fact` requires non-empty
+provenance and joining on every read looked wasteful.
+
+That is a fabrication in the one area where the product's credibility rests. Anything
+reading `fact.provenance` would have been actively misled.
+
+**Fix:** `_hydrate_facts` batch-loads real provenance — one query for a whole page
+rather than two per fact — and skips any fact with no provenance row with an ERROR log
+rather than inventing traceability. `active_facts` and `facts_for_entity` now use the
+batched path, which also removes an N+1.
+
+### Finding 4 — `SchemaDriftCheck` was documented but never written
+
+Referenced in `components.md`, in `tables.py`'s docstring, in the Unit 1a completion
+summary, and retained explicitly when offered for removal. It did not exist.
+
+**Fix:** implemented `config/schema_drift.py`, wired into the startup sequence after
+migrations. Compares declared table metadata against `information_schema`, failing on
+missing tables or columns. Names only, not types: cross-dialect type comparison is
+brittle enough to produce false alarms, and a test people learn to ignore is worse than
+no test.
+
+### Verified good
+
+| Check | Result |
+|---|---|
+| `tables.py` agrees with the migrations | **Yes** — 15 consistency tests confirm every declared table and column exists in a `CREATE TABLE` |
+| No bare `TIMESTAMP` columns | Confirmed, all `TIMESTAMPTZ` (ADR-011) |
+| No `metadata.create_all()` anywhere | Confirmed by AST scan |
+| Migrations do not manage their own transactions | Confirmed |
+| `.gitignore` | Correct — `.env`, `venv/`, `api_test.py`, `key_test.py` all excluded |
+| Boundary rules 1, 2, 4, 6 | Still holding |
+
+### New offline safety net
+
+`tests/unit/test_schema_consistency.py` performs SchemaDriftCheck's comparison against
+the `.sql` files instead of a live database. This matters practically: development
+happens on a machine with no container runtime, so schema drift would otherwise stay
+invisible until someone tried to boot elsewhere and lost a session to it.
+
+`tests/unit/test_postgres_insert_contracts.py` inspects compiled statement parameters
+to assert no `NOT NULL` column is ever bound to `NULL`. This is the class of bug that
+findings 1 and 2 belonged to, and it is catchable without a database.
+
+### Two false positives in my own new tests, fixed
+
+Both matched prose in comments rather than code — the exact trap the `datetime.now()`
+guard hit earlier:
+
+- the bare-`TIMESTAMP` scan matched the word "timestamp" in a SQL comment. Now strips
+  `--` comments and is case-sensitive.
+- the `create_all` scan matched docstrings *documenting that it is never called*. Now
+  uses AST.
+
+### Tests
+
+**224 passing**, up from 198.
+
+### Not crucial, deliberately carried forward
+
+| Item | Disposition |
+|---|---|
+| `commit` not transactional across all writes | Unit 3, with the belief-history and operation-log writes that must be atomic alongside |
+| No conflict detection | Unit 3 |
+| Salience weights untuned | Needs a real corpus; ordering is the considered part |
+| Extraction still inside the request | Unit 5 (ADR-008) |
+| `provenance_index.memory_kind` permits `'entity'`, unused | Harmless; entity provenance may be wanted later |
+| No cap on extraction volume per message | Cost deferred by user |
+
+## 2026-08-24 - Unit 2 first activation attempt: partial success, one new design gap
+
+### Test
+
+> "My Colleague Pradeep is a Agentic Ai developer, He is from Tamil Nadu"
+
+Result: 2 facts and 3 entities written; **0 relationships**, because the insert raised
+
+```
+null value in column "created_at" of relation "relationships" violates not-null constraint
+```
+
+### Cause: stale code, not a new defect
+
+That is precisely the bug fixed in the pre-activation audit (finding 1). Verified the
+local source carries `created_at=self._clock.now()` on all three inserts, and
+`test_relationship_with_default_validity_still_supplies_created_at` passes. The
+deployment was synced after Unit 2 was written but before the audit fixes. Re-sync
+resolves it.
+
+### What the run nonetheless proved
+
+| Signal | Reading |
+|---|---|
+| `extraction_complete relationships=2` | Extraction **is** capturing relationships. Only persistence failed |
+| `graph_episode_added entities=2 edges=1` | Graphiti ingestion working with the prescribed ontology |
+| `facts` rows with `salience_category` | Migration 0002 applied; salience scoring live (identity 0.80 > location 0.65) |
+| Correct ordering | Occupation outranked location, as the weight table intends |
+
+So Unit 2's core capability works. The Unit 1b gap — dropping the occupation — is closed.
+
+### NEW FINDING — no canonical self entity
+
+Entities written: `Pradeep` (person), `Tamil Nadu` (place), and **`user` (other)**.
+
+That third row is a real design gap, not a cosmetic one. Extraction refers to the
+speaker inconsistently — "user" here, plausibly "me" or "I" next time. Because those
+are *different names*, resolution takes the CREATED branch every time and **never even
+flags ambiguity**.
+
+This is worse than the ambiguous-duplicate case ADR-014 handles. There, a provisional
+entity and a warning are produced. Here there is no signal at all: self-duplicates fan
+out silently and every relationship about the user fragments across them. For the one
+entity that appears in nearly every relationship, that is the most damaging possible
+place to lose identity.
+
+It was also typed `other` rather than `person`, which would exclude the user from
+person-scoped queries.
+
+**Fix:** canonical self entity in `EntityService`.
+
+- `SELF_ENTITY_NAME = "the user"`, typed PERSON
+- `SELF_ALIASES` covering user / me / i / myself / my / mine / self / the speaker / narrator
+- First-person mentions short-circuit to it *before* name matching
+- `resolve_self()` adopts an entity created under any alias by a previous run, adding
+  the canonical alias set so future lookups converge rather than continuing to diverge
+- Extraction prompt now instructs the model to say exactly "the user"
+
+16 tests added, including every alias resolving to one entity, adoption of the legacy
+`user` row, and confirmation that a real person is never confused with the self entity.
+
+### Also observed
+
+| Observation | Note |
+|---|---|
+| Partial commit | Facts committed, relationships failed, leaving a half-written episode. This is the non-transactional-commit gap flagged for Unit 3, now demonstrated rather than theoretical |
+| `add_episode` took 11.6 s | Graphiti runs its own LLM extraction. Relevant to the retrieval budget and to ADR-008's case for moving this off the request |
+| `AFC is enabled with max remote calls: 10` | Graphiti's own Gemini client, not ours. We disable automatic function calling on our adapter; Graphiti configures its own. Log noise only |
+
+### Tests
+
+**240 passing**, up from 224.

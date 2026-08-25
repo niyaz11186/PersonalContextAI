@@ -34,6 +34,7 @@ from pca.adapters.postgres.memory_repositories import (
 )
 from pca.adapters.postgres.store import PostgresStoreAdapter
 from pca.config.migrations import MigrationRunner
+from pca.config.schema_drift import SchemaDriftCheck
 from pca.config.settings import Settings, get_settings
 from pca.observability.logging import configure_logging, get_logger
 from pca.orchestration.conversation_workflow import ConversationWorkflow
@@ -61,6 +62,7 @@ class Container:
     graph: GraphitiMemoryAdapter
     provider: GeminiProviderAdapter
     migrations: MigrationRunner
+    schema_drift: SchemaDriftCheck
     conversations: ConversationService
     episodes: EpisodeService
     extraction: ExtractionService
@@ -106,7 +108,7 @@ def build_container(settings: Settings | None = None) -> Container:
     conversation_repository = PostgresConversationRepository(store)
     episode_repository = PostgresEpisodeRepository(store, clock)
     entity_repository = PostgresEntityRepository(store)
-    memory_repository = PostgresMemoryRepository(store)
+    memory_repository = PostgresMemoryRepository(store, clock)
     provenance_repository = PostgresProvenanceRepository(store)
 
     conversations = ConversationService(repository=conversation_repository, clock=clock)
@@ -154,6 +156,7 @@ def build_container(settings: Settings | None = None) -> Container:
         graph=graph,
         provider=provider,
         migrations=MigrationRunner(store, clock, Path("migrations")),
+        schema_drift=SchemaDriftCheck(store),
         conversations=conversations,
         episodes=episodes,
         extraction=extraction,
@@ -174,6 +177,12 @@ async def start(container: Container) -> None:
     applied = await container.migrations.apply_pending()
     if applied:
         _log.info("migrations_applied", versions=[a.version for a in applied])
+
+    # Compare declared table metadata against the live schema. This is the safety
+    # property that not using Alembic would otherwise cost: without it, a column
+    # declared in tables.py but missing from every migration fails at whichever query
+    # touches it first, potentially weeks later.
+    await container.schema_drift.assert_matches()
 
     await container.graph.initialise()
 

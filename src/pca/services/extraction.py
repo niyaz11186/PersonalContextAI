@@ -82,6 +82,9 @@ Rules you must follow:
 - SPLIT COMPOUND STATEMENTS. "My friend Suresh is a frontend developer in
   Visakhapatnam" contains a relationship (friend), an occupation, and a location.
   Extract each separately rather than as one blob.
+- THE USER. Refer to the person speaking as exactly "the user", with entity_type
+  "person". Never "me", "I", "user", or "myself". Consistency matters here because
+  almost every relationship connects back to them.
 - DO NOT INVENT. No people, places, dates, or details that are not present or
   directly implied.
 - Prefer including a borderline item over dropping it.
