@@ -24,6 +24,22 @@ class Transaction(Protocol):
     async def fetch_one(self, statement: Any, parameters: Any | None = None) -> Any | None: ...
 
 
+class TransactionManagerPort(Protocol):
+    """The ability to open a transaction, and nothing else.
+
+    Unit 3 needs `MemoryService` to make a multi-repository write atomic, which means
+    it must be able to start a transaction. Giving it the full `RelationalStorePort`
+    would hand it `execute`, `fetch_all`, and `execute_script` as well — and the
+    repository design refinement is explicit that domain services depend on repository
+    ports rather than on the store, precisely so that raw SQL cannot drift into L3.
+
+    This narrower protocol grants the one capability required. `PostgresStoreAdapter`
+    already satisfies it structurally, so no additional adapter exists to keep in sync.
+    """
+
+    def transaction(self) -> AbstractAsyncContextManager[Transaction]: ...
+
+
 class RelationalStorePort(Protocol):
     async def execute(self, statement: Any, parameters: Any | None = None) -> Any: ...
 

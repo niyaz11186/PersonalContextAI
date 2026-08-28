@@ -43,9 +43,10 @@ from pca.domain.memory import (
     Relationship,
 )
 from pca.domain.temporal import BeliefWindow, TemporalExpression, TemporalValidity
+from pca.adapters.postgres.scope import scope
 from pca.observability.logging import get_logger
 from pca.ports.clock import ClockPort
-from pca.ports.store import RelationalStorePort
+from pca.ports.store import RelationalStorePort, Transaction
 
 _log = get_logger(__name__)
 
@@ -83,18 +84,22 @@ class PostgresEntityRepository:
         created_at: datetime,
         is_provisional: bool = False,
         aliases: Sequence[str] = (),
+        tx: Transaction | None = None,
     ) -> Entity:
-        await self._store.execute(
-            insert(entities_table).values(
-                id=entity_id,
-                name=name,
-                entity_type=entity_type.value,
-                is_provisional=is_provisional,
-                created_at=created_at,
+        async with scope(self._store, tx) as t:
+            await t.execute(
+                insert(entities_table).values(
+                    id=entity_id,
+                    name=name,
+                    entity_type=entity_type.value,
+                    is_provisional=is_provisional,
+                    created_at=created_at,
+                )
             )
-        )
-        if aliases:
-            await self.add_aliases(entity_id, aliases)
+            if aliases:
+                # Same scope: an entity created with aliases must not be able to land
+                # without them, or self-entity resolution would stop converging.
+                await self.add_aliases(entity_id, aliases, tx=t)
         return Entity(
             id=entity_id,
             name=name,
@@ -159,36 +164,54 @@ class PostgresEntityRepository:
         )
         return [await self._hydrate(row) for row in rows]
 
-    async def add_aliases(self, entity_id: EntityId, aliases: Sequence[str]) -> None:
-        for alias in aliases:
-            cleaned = alias.strip()
-            if not cleaned:
-                continue
-            # Idempotent: the primary key is (entity_id, alias), so a repeated merge
-            # must not fail on a duplicate.
-            existing = await self._store.fetch_one(
-                select(entity_aliases).where(
-                    and_(
-                        entity_aliases.c.entity_id == entity_id,
-                        entity_aliases.c.alias == cleaned,
+    async def add_aliases(
+        self,
+        entity_id: EntityId,
+        aliases: Sequence[str],
+        tx: Transaction | None = None,
+    ) -> None:
+        async with scope(self._store, tx) as t:
+            for alias in aliases:
+                cleaned = alias.strip()
+                if not cleaned:
+                    continue
+                # Idempotent: the primary key is (entity_id, alias), so a repeated
+                # merge must not fail on a duplicate. The check reads through the same
+                # scope as the insert, so it sees aliases added earlier in this loop.
+                existing = await t.fetch_one(
+                    select(entity_aliases).where(
+                        and_(
+                            entity_aliases.c.entity_id == entity_id,
+                            entity_aliases.c.alias == cleaned,
+                        )
                     )
                 )
-            )
-            if existing is None:
-                await self._store.execute(
-                    insert(entity_aliases).values(entity_id=entity_id, alias=cleaned)
-                )
+                if existing is None:
+                    await t.execute(
+                        insert(entity_aliases).values(
+                            entity_id=entity_id, alias=cleaned
+                        )
+                    )
 
     async def merge(
-        self, keep: EntityId, absorb: EntityId, reason: str, merged_at: datetime
+        self,
+        keep: EntityId,
+        absorb: EntityId,
+        reason: str,
+        merged_at: datetime,
+        tx: Transaction | None = None,
     ) -> None:
         """Point the absorbed entity at the survivor and repoint its references.
 
         The absorbed row is retained rather than deleted so the operation stays
         reversible (ADR-014). Its fact, event, and relationship links are moved so
         queries about the surviving entity see the full picture.
+
+        Accepts `tx` so the merge and its operation-log entry commit together. A merge
+        that landed without its log entry would be an irreversible merge, which is
+        precisely what ADR-014 forbids.
         """
-        async with self._store.transaction() as tx:
+        async with scope(self._store, tx) as tx:
             await tx.execute(
                 update(entities_table)
                 .where(entities_table.c.id == absorb)
@@ -278,10 +301,15 @@ class PostgresMemoryRepository:
         self._store = store
         self._clock = clock
 
-    async def insert_fact(self, fact: Fact, salience_category: str | None) -> Fact:
+    async def insert_fact(
+        self,
+        fact: Fact,
+        salience_category: str | None,
+        tx: Transaction | None = None,
+    ) -> Fact:
         expression = fact.temporal_expression
-        async with self._store.transaction() as tx:
-            await tx.execute(
+        async with scope(self._store, tx) as t:
+            await t.execute(
                 insert(facts).values(
                     id=fact.id,
                     statement=fact.statement,
@@ -304,15 +332,20 @@ class PostgresMemoryRepository:
                 )
             )
             for entity_id in fact.subject_entity_ids:
-                await tx.execute(
+                await t.execute(
                     insert(fact_subjects).values(fact_id=fact.id, entity_id=entity_id)
                 )
         return fact
 
-    async def insert_event(self, event: Event, salience_category: str | None) -> Event:
+    async def insert_event(
+        self,
+        event: Event,
+        salience_category: str | None,
+        tx: Transaction | None = None,
+    ) -> Event:
         expression = event.temporal_expression
-        async with self._store.transaction() as tx:
-            await tx.execute(
+        async with scope(self._store, tx) as t:
+            await t.execute(
                 insert(events).values(
                     id=event.id,
                     description=event.description,
@@ -331,26 +364,32 @@ class PostgresMemoryRepository:
                 )
             )
             for entity_id in event.participant_entity_ids:
-                await tx.execute(
+                await t.execute(
                     insert(event_participants).values(
                         event_id=event.id, entity_id=entity_id
                     )
                 )
         return event
 
-    async def insert_relationship(self, relationship: Relationship) -> Relationship:
-        await self._store.execute(
-            insert(relationships).values(
-                id=relationship.id,
-                from_entity_id=relationship.from_entity_id,
-                to_entity_id=relationship.to_entity_id,
-                relation_type=relationship.relation_type,
-                origin=relationship.origin.value,
-                valid_from=relationship.validity.valid_from,
-                valid_to=relationship.validity.valid_to,
-                created_at=self._clock.now(),
+    async def insert_relationship(
+        self, relationship: Relationship, tx: Transaction | None = None
+    ) -> Relationship:
+        async with scope(self._store, tx) as t:
+            await t.execute(
+                insert(relationships).values(
+                    id=relationship.id,
+                    from_entity_id=relationship.from_entity_id,
+                    to_entity_id=relationship.to_entity_id,
+                    relation_type=relationship.relation_type,
+                    origin=relationship.origin.value,
+                    valid_from=relationship.validity.valid_from,
+                    valid_to=relationship.validity.valid_to,
+                    # From the clock, never from a temporal field. Deriving this from
+                    # validity.valid_from produced NULL for undated relationships and
+                    # failed every insert with NotNullViolationError.
+                    created_at=self._clock.now(),
+                )
             )
-        )
         return relationship
 
     async def get_fact(self, memory_id: MemoryId) -> Fact | None:
@@ -427,6 +466,110 @@ class PostgresMemoryRepository:
     async def count_facts(self) -> int:
         row = await self._store.fetch_one(select(func.count()).select_from(facts))
         return int(next(iter(row.values()))) if row else 0
+
+    # -------------------------------------------------------- evolution (Unit 3)
+
+    async def end_belief(
+        self,
+        memory_id: MemoryId,
+        retracted_at: datetime,
+        tx: Transaction | None = None,
+    ) -> None:
+        """Belief axis. The system stops believing this; world validity untouched."""
+        async with scope(self._store, tx) as t:
+            await t.execute(
+                update(facts)
+                .where(and_(facts.c.id == memory_id, facts.c.retracted_at.is_(None)))
+                .values(retracted_at=retracted_at)
+            )
+
+    async def end_validity(
+        self,
+        memory_id: MemoryId,
+        valid_to: datetime,
+        tx: Transaction | None = None,
+    ) -> None:
+        """World axis. It stopped being true; the system still believes it once was."""
+        async with scope(self._store, tx) as t:
+            await t.execute(
+                update(facts)
+                .where(facts.c.id == memory_id)
+                .values(valid_to=valid_to)
+            )
+
+    async def update_statement(
+        self,
+        memory_id: MemoryId,
+        statement: str,
+        tx: Transaction | None = None,
+    ) -> None:
+        async with scope(self._store, tx) as t:
+            await t.execute(
+                update(facts).where(facts.c.id == memory_id).values(statement=statement)
+            )
+
+    async def link_supersession(
+        self,
+        original_id: MemoryId,
+        replacement_id: MemoryId,
+        tx: Transaction | None = None,
+    ) -> None:
+        async with scope(self._store, tx) as t:
+            await t.execute(
+                update(facts)
+                .where(facts.c.id == original_id)
+                .values(superseded_by=replacement_id)
+            )
+            await t.execute(
+                update(facts)
+                .where(facts.c.id == replacement_id)
+                .values(supersedes=original_id)
+            )
+
+    async def link_correction(
+        self,
+        original_id: MemoryId,
+        replacement_id: MemoryId,
+        tx: Transaction | None = None,
+    ) -> None:
+        async with scope(self._store, tx) as t:
+            await t.execute(
+                update(facts)
+                .where(facts.c.id == replacement_id)
+                .values(corrected_from=original_id)
+            )
+
+    async def facts_valid_at(self, when: datetime, limit: int = 200) -> Sequence[Fact]:
+        """World-time query: true at `when`, according to what we believe now.
+
+        NULL `valid_from` means the start is unknown, not that the fact began at the
+        epoch. Such facts are included, because refusing to report an undated fact as
+        currently true would hide most of what the system knows — ADR-010 leaves dates
+        null rather than fabricating them, so nulls are the common case.
+        """
+        rows = await self._store.fetch_all(
+            select(facts)
+            .where(
+                and_(
+                    facts.c.retracted_at.is_(None),
+                    or_(facts.c.valid_from.is_(None), facts.c.valid_from <= when),
+                    or_(facts.c.valid_to.is_(None), facts.c.valid_to > when),
+                )
+            )
+            .order_by(facts.c.salience.desc(), facts.c.created_at.desc())
+            .limit(limit)
+        )
+        return await self._hydrate_facts(rows)
+
+    async def facts_asserted_between(
+        self, start: datetime, end: datetime
+    ) -> Sequence[Fact]:
+        rows = await self._store.fetch_all(
+            select(facts)
+            .where(and_(facts.c.asserted_at > start, facts.c.asserted_at <= end))
+            .order_by(facts.c.asserted_at)
+        )
+        return await self._hydrate_facts(rows)
 
     async def _load_provenance(
         self, fact_ids: Sequence[MemoryId]
@@ -532,33 +675,35 @@ class PostgresProvenanceRepository:
         memory_kind: MemoryKind,
         ref: ProvenanceRef,
         recorded_at: datetime,
+        tx: Transaction | None = None,
     ) -> None:
-        # Idempotent. A retried commit must not inflate the corroboration count, or
-        # a single-source fact would look corroborated and survive a deletion that
-        # should have retracted it (ADR-012).
-        existing = await self._store.fetch_one(
-            select(provenance_index).where(
-                and_(
-                    provenance_index.c.memory_id == memory_id,
-                    provenance_index.c.memory_kind == memory_kind.value,
-                    provenance_index.c.episode_id == ref.episode_id,
+        async with scope(self._store, tx) as t:
+            # Idempotent. A retried commit must not inflate the corroboration count,
+            # or a single-source fact would look corroborated and survive a deletion
+            # that should have retracted it (ADR-012).
+            existing = await t.fetch_one(
+                select(provenance_index).where(
+                    and_(
+                        provenance_index.c.memory_id == memory_id,
+                        provenance_index.c.memory_kind == memory_kind.value,
+                        provenance_index.c.episode_id == ref.episode_id,
+                    )
                 )
             )
-        )
-        if existing is not None:
-            return
+            if existing is not None:
+                return
 
-        await self._store.execute(
-            insert(provenance_index).values(
-                memory_id=memory_id,
-                memory_kind=memory_kind.value,
-                episode_id=ref.episode_id,
-                conversation_id=ref.conversation_id,
-                message_id=ref.message_id,
-                document_id=ref.document_id,
-                recorded_at=recorded_at,
+            await t.execute(
+                insert(provenance_index).values(
+                    memory_id=memory_id,
+                    memory_kind=memory_kind.value,
+                    episode_id=ref.episode_id,
+                    conversation_id=ref.conversation_id,
+                    message_id=ref.message_id,
+                    document_id=ref.document_id,
+                    recorded_at=recorded_at,
+                )
             )
-        )
 
     async def for_memory(
         self, memory_id: MemoryId, memory_kind: MemoryKind

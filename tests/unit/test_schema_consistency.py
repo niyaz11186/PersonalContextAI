@@ -42,6 +42,23 @@ def create_block(sql: str, table: str) -> str | None:
     return match.group(1) if match else None
 
 
+def added_columns(sql: str, table: str) -> set[str]:
+    """Columns introduced by `ALTER TABLE ... ADD COLUMN` after the table was created.
+
+    Necessary because ADR-004 makes migrations forward-only: a column added to an
+    existing table CANNOT be edited into its original CREATE TABLE, so it will only
+    ever appear in an ALTER. Checking the CREATE block alone would report every such
+    column as missing and push someone toward rewriting an applied migration — the one
+    thing the forward-only rule exists to prevent.
+    """
+    pattern = re.compile(
+        rf"ALTER\s+TABLE\s+{re.escape(table)}\s+ADD\s+COLUMN\s+"
+        rf"(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
+        re.IGNORECASE,
+    )
+    return {match.group(1) for match in pattern.finditer(sql)}
+
+
 @pytest.fixture(scope="module")
 def sql() -> str:
     return migration_sql()
@@ -66,12 +83,14 @@ def test_every_declared_column_exists_in_the_migration(table_name: str, sql: str
     block = create_block(sql, table_name)
     assert block is not None, f"no CREATE TABLE for {table_name}"
 
+    altered = added_columns(sql, table_name)
     declared = {column.name for column in metadata.tables[table_name].columns}
     # Word-boundary match so `valid_to` is not satisfied by `valid_from`.
     absent = {
         column
         for column in declared
-        if not re.search(rf"\b{re.escape(column)}\b", block)
+        if column not in altered
+        and not re.search(rf"\b{re.escape(column)}\b", block)
     }
 
     assert not absent, (

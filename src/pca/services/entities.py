@@ -37,6 +37,7 @@ from pca.domain.memory import Entity, EntityMatch, ResolutionDecision
 from pca.observability.logging import get_logger
 from pca.ports.clock import ClockPort
 from pca.ports.repositories import EntityRepositoryPort
+from pca.ports.store import Transaction
 
 _log = get_logger(__name__)
 
@@ -95,11 +96,19 @@ class EntityService:
     # ----------------------------------------------------------------- resolve
 
     async def resolve_for_extraction(
-        self, mention: str, entity_type: EntityType = EntityType.PERSON
+        self,
+        mention: str,
+        entity_type: EntityType = EntityType.PERSON,
+        tx: Transaction | None = None,
     ) -> ResolutionDecision:
         """Resolve a mention during automatic extraction.
 
         Never merges. Never picks between competing candidates.
+
+        `tx` lets resolution join the caller's commit transaction, so a commit that
+        fails leaves no entities behind. Orphan entities would be harmless in
+        isolation, but a provisional one also emits an "ambiguous entity" warning —
+        operational noise about a commit that never happened.
         """
         mention = mention.strip()
         if not mention:
@@ -109,7 +118,7 @@ class EntityService:
         # matching happens. Otherwise "me" and "user" are simply different names and
         # each creates its own entity, fragmenting every relationship about the user.
         if is_self_mention(mention):
-            entity = await self.resolve_self()
+            entity = await self.resolve_self(tx=tx)
             _log.info("self_mention_linked", mention=mention, entity_id=str(entity.id))
             return ResolutionDecision(
                 outcome=ResolutionOutcome.LINKED,
@@ -139,7 +148,7 @@ class EntityService:
             # until you consider the alternative: silently attributing a fact to the
             # wrong person, permanently, with no signal that it happened.
             provisional = await self._create(
-                mention, entity_type, is_provisional=True
+                mention, entity_type, is_provisional=True, tx=tx
             )
             _log.warning(
                 "entity_ambiguous_provisional_created",
@@ -155,7 +164,9 @@ class EntityService:
                 needs_clarification=True,
             )
 
-        created = await self._create(mention, entity_type, is_provisional=False)
+        created = await self._create(
+            mention, entity_type, is_provisional=False, tx=tx
+        )
         _log.info("entity_created", mention=mention, entity_id=str(created.id))
         return ResolutionDecision(
             outcome=ResolutionOutcome.CREATED,
@@ -163,7 +174,7 @@ class EntityService:
             considered=candidates,
         )
 
-    async def resolve_self(self) -> Entity:
+    async def resolve_self(self, tx: Transaction | None = None) -> Entity:
         """Find or create the canonical entity representing the user.
 
         Seeded with every first-person alias so that a later mention of any of them
@@ -184,7 +195,7 @@ class EntityService:
                 # Adopt it: give it the canonical name's alias set so subsequent
                 # lookups converge rather than continuing to diverge.
                 await self._repository.add_aliases(
-                    found[0].id, sorted(SELF_ALIASES)
+                    found[0].id, sorted(SELF_ALIASES), tx=tx
                 )
                 _log.info(
                     "self_entity_adopted_existing",
@@ -200,12 +211,16 @@ class EntityService:
             created_at=self._clock.now(),
             is_provisional=False,
             aliases=sorted(SELF_ALIASES),
+            tx=tx,
         )
         _log.info("self_entity_created", entity_id=str(created.id))
         return created
 
     async def resolve_many(
-        self, mentions: Sequence[str], entity_type: EntityType = EntityType.PERSON
+        self,
+        mentions: Sequence[str],
+        entity_type: EntityType = EntityType.PERSON,
+        tx: Transaction | None = None,
     ) -> dict[str, ResolutionDecision]:
         """Resolve several mentions, deduplicating within the batch.
 
@@ -296,7 +311,11 @@ class EntityService:
         return sorted(matches, key=lambda m: m.score, reverse=True)
 
     async def _create(
-        self, name: str, entity_type: EntityType, is_provisional: bool
+        self,
+        name: str,
+        entity_type: EntityType,
+        is_provisional: bool,
+        tx: Transaction | None = None,
     ) -> Entity:
         return await self._repository.create(
             entity_id=EntityId(uuid4()),
@@ -304,4 +323,5 @@ class EntityService:
             entity_type=entity_type,
             created_at=self._clock.now(),
             is_provisional=is_provisional,
+            tx=tx,
         )

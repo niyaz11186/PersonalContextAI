@@ -35,10 +35,17 @@ from pca.domain.extraction import (
 )
 from pca.domain.ids import ConversationId, EntityId, EpisodeId, MessageId
 from pca.domain.temporal import TemporalExpression
+from pca.services.belief_history import BeliefHistoryService
 from pca.services.entities import EntityService
 from pca.services.memory import MemoryService
+from pca.services.operation_log import MemoryOperationLog
 from pca.services.provenance import ProvenanceService
 from tests.fakes.clock import FakeClock
+from tests.fakes.history_repositories import (
+    FakeBeliefRepository,
+    FakeOperationLogRepository,
+    FakeTransactionManager,
+)
 from tests.fakes.memory_repositories import (
     FakeEntityRepository,
     FakeMemoryRepository,
@@ -71,11 +78,37 @@ def provenance_repo() -> FakeProvenanceRepository:
 
 
 @pytest.fixture
+def belief_repo() -> FakeBeliefRepository:
+    return FakeBeliefRepository()
+
+
+@pytest.fixture
+def operation_repo() -> FakeOperationLogRepository:
+    return FakeOperationLogRepository()
+
+
+@pytest.fixture
+def transactions(
+    memory_repo: FakeMemoryRepository,
+    entity_repo: FakeEntityRepository,
+    provenance_repo: FakeProvenanceRepository,
+    belief_repo: FakeBeliefRepository,
+    operation_repo: FakeOperationLogRepository,
+) -> FakeTransactionManager:
+    return FakeTransactionManager(
+        memory_repo, entity_repo, provenance_repo, belief_repo, operation_repo
+    )
+
+
+@pytest.fixture
 def service(
     clock: FakeClock,
     memory_repo: FakeMemoryRepository,
     entity_repo: FakeEntityRepository,
     provenance_repo: FakeProvenanceRepository,
+    belief_repo: FakeBeliefRepository,
+    operation_repo: FakeOperationLogRepository,
+    transactions: FakeTransactionManager,
 ) -> MemoryService:
     return MemoryService(
         repository=memory_repo,
@@ -86,6 +119,9 @@ def service(
             clock=clock,
         ),
         clock=clock,
+        transactions=transactions,
+        beliefs=BeliefHistoryService(repository=belief_repo, clock=clock),
+        operations=MemoryOperationLog(repository=operation_repo, clock=clock),
     )
 
 

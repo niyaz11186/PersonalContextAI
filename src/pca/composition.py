@@ -27,6 +27,10 @@ from pca.adapters.gemini.provider import GeminiProviderAdapter
 from pca.adapters.graphiti.memory_graph import GraphitiMemoryAdapter
 from pca.adapters.postgres.conversation_repository import PostgresConversationRepository
 from pca.adapters.postgres.episode_repository import PostgresEpisodeRepository
+from pca.adapters.postgres.history_repositories import (
+    PostgresBeliefRepository,
+    PostgresOperationLogRepository,
+)
 from pca.adapters.postgres.memory_repositories import (
     PostgresEntityRepository,
     PostgresMemoryRepository,
@@ -38,16 +42,20 @@ from pca.config.schema_drift import SchemaDriftCheck
 from pca.config.settings import Settings, get_settings
 from pca.observability.logging import configure_logging, get_logger
 from pca.orchestration.conversation_workflow import ConversationWorkflow
+from pca.services.belief_history import BeliefHistoryService
+from pca.services.conflicts import ConflictDetectionService
 from pca.services.context_assembly import ContextAssemblyService
 from pca.services.conversation import ConversationService
 from pca.services.entities import EntityService
 from pca.services.episodes import EpisodeService
 from pca.services.extraction import ExtractionService
 from pca.services.memory import MemoryService
+from pca.services.operation_log import MemoryOperationLog
 from pca.services.provenance import ProvenanceService
 from pca.services.retrieval import RetrievalService
 from pca.services.salience import SalienceScorer
 from pca.services.time_resolver import TimeResolver
+from pca.services.timeline import TimelineService
 
 _log = get_logger(__name__)
 
@@ -72,6 +80,10 @@ class Container:
     entities: EntityService
     provenance: ProvenanceService
     memory: MemoryService
+    beliefs: BeliefHistoryService
+    operations: MemoryOperationLog
+    timeline: TimelineService
+    conflicts: ConflictDetectionService
 
 
 def build_container(settings: Settings | None = None) -> Container:
@@ -110,6 +122,8 @@ def build_container(settings: Settings | None = None) -> Container:
     entity_repository = PostgresEntityRepository(store)
     memory_repository = PostgresMemoryRepository(store, clock)
     provenance_repository = PostgresProvenanceRepository(store)
+    belief_repository = PostgresBeliefRepository(store)
+    operation_repository = PostgresOperationLogRepository(store)
 
     conversations = ConversationService(repository=conversation_repository, clock=clock)
 
@@ -119,11 +133,28 @@ def build_container(settings: Settings | None = None) -> Container:
         conversations=conversation_repository,
         clock=clock,
     )
+    beliefs = BeliefHistoryService(repository=belief_repository, clock=clock)
+    operations = MemoryOperationLog(repository=operation_repository, clock=clock)
     memory = MemoryService(
         repository=memory_repository,
         entities=entities,
         provenance=provenance,
         clock=clock,
+        # The store itself satisfies TransactionManagerPort structurally, so the
+        # commit boundary needs no extra adapter.
+        transactions=store,
+        beliefs=beliefs,
+        operations=operations,
+    )
+    timeline = TimelineService(
+        memory=memory_repository, beliefs=belief_repository, clock=clock
+    )
+    conflicts = ConflictDetectionService(
+        memory=memory_repository,
+        llm=provider,
+        # The small model. Conflict classification is a two-statement comparison —
+        # the same shape of work as salience, and it does not need the large model.
+        classifier_model=settings.llm_small_model,
     )
     episodes = EpisodeService(
         repository=episode_repository,
@@ -166,6 +197,10 @@ def build_container(settings: Settings | None = None) -> Container:
         entities=entities,
         provenance=provenance,
         memory=memory,
+        beliefs=beliefs,
+        operations=operations,
+        timeline=timeline,
+        conflicts=conflicts,
     )
 
 

@@ -27,18 +27,27 @@ from pca.config.schema_drift import SchemaDriftCheck
 from pca.config.settings import Settings
 from pca.main import create_app
 from pca.orchestration.conversation_workflow import ConversationWorkflow
+from pca.services.belief_history import BeliefHistoryService
+from pca.services.conflicts import ConflictDetectionService
 from pca.services.context_assembly import ContextAssemblyService
 from pca.services.conversation import ConversationService
 from pca.services.entities import EntityService
 from pca.services.episodes import EpisodeService
 from pca.services.extraction import ExtractedFact, ExtractionPayload, ExtractionService
 from pca.services.memory import MemoryService
+from pca.services.operation_log import MemoryOperationLog
 from pca.services.provenance import ProvenanceService
 from pca.services.retrieval import RetrievalService
 from pca.services.salience import SalienceScorer
 from pca.services.time_resolver import TimeResolver
+from pca.services.timeline import TimelineService
 from tests.fakes.clock import FakeClock
 from tests.fakes.graph import FakeMemoryGraph
+from tests.fakes.history_repositories import (
+    FakeBeliefRepository,
+    FakeOperationLogRepository,
+    FakeTransactionManager,
+)
 from tests.fakes.llm import FakeLLMProvider
 from tests.fakes.memory_repositories import (
     FakeEntityRepository,
@@ -108,11 +117,23 @@ def build_fake_container(
         conversations=conversation_repository,
         clock=clock,
     )
+    belief_repository = FakeBeliefRepository()
+    operation_repository = FakeOperationLogRepository()
+    transactions = FakeTransactionManager(
+        memory_repository,
+        entity_repository,
+        provenance_repository,
+        belief_repository,
+        operation_repository,
+    )
     memory = MemoryService(
         repository=memory_repository,
         entities=entities,
         provenance=provenance,
         clock=clock,
+        transactions=transactions,
+        beliefs=BeliefHistoryService(repository=belief_repository, clock=clock),
+        operations=MemoryOperationLog(repository=operation_repository, clock=clock),
     )
     episodes = EpisodeService(
         repository=episode_repository,
@@ -150,6 +171,17 @@ def build_fake_container(
         entities=entities,
         provenance=provenance,
         memory=memory,
+        beliefs=BeliefHistoryService(repository=belief_repository, clock=clock),  # type: ignore[arg-type]
+        operations=MemoryOperationLog(repository=operation_repository, clock=clock),  # type: ignore[arg-type]
+        timeline=TimelineService(
+            memory=memory_repository,  # type: ignore[arg-type]
+            beliefs=belief_repository,  # type: ignore[arg-type]
+            clock=clock,  # type: ignore[arg-type]
+        ),
+        conflicts=ConflictDetectionService(
+            memory=memory_repository,  # type: ignore[arg-type]
+            llm=provider,  # type: ignore[arg-type]
+        ),
     )
 
     # Test scaffolding: expose the fakes so assertions can inspect what was actually
@@ -157,6 +189,9 @@ def build_fake_container(
     container.test_memory_repo = memory_repository  # type: ignore[attr-defined]
     container.test_entity_repo = entity_repository  # type: ignore[attr-defined]
     container.test_provenance_repo = provenance_repository  # type: ignore[attr-defined]
+    container.test_belief_repo = belief_repository  # type: ignore[attr-defined]
+    container.test_operation_repo = operation_repository  # type: ignore[attr-defined]
+    container.test_transactions = transactions  # type: ignore[attr-defined]
     return container
 
 

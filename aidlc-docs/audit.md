@@ -984,3 +984,123 @@ person-scoped queries.
 ### Tests
 
 **240 passing**, up from 224.
+
+## 2026-08-25 - CONSTRUCTION: Unit 3 Temporal Integrity Code Complete
+
+### User input
+
+```
+Alright then if there are anyting cruicial missing go ahead complete if not go ahead
+for the next unit
+```
+
+### Crucial prerequisite found and fixed before Unit 3 work began
+
+`MemoryService.commit` was **not transactional**. Confirmed by reading the code, and
+already demonstrated live during Unit 2 activation: a commit wrote facts and entities,
+then failed on the relationship insert, leaving a half-written episode behind with no
+signal that anything was missing.
+
+This genuinely blocked Unit 3 rather than being untidy. A supersession writes the
+replacement fact, ends the original's world validity, appends two belief transitions,
+and appends an audit row. Any subset landing without the others produces a corrupt
+timeline that no later read can detect — a fact marked superseded with no record of why.
+
+**Fix**: `tx: Transaction | None = None` on every repository write method; one
+transaction opened in `MemoryService` and threaded down through entity resolution,
+memory rows, provenance, belief history, and the audit entry.
+
+**Rejected**: a `UnitOfWork` port bundling every repository. More machinery for the same
+guarantee, and services would depend on the bundle rather than on the one or two
+repositories they actually use.
+
+### New port introduced to avoid weakening C-25
+
+`MemoryService` needs to open a transaction, but C-25 says domain services depend on
+repository ports, never on `RelationalStorePort`. Handing it the full store port would
+also hand it `execute`, `fetch_all`, and `execute_script`.
+
+Added `TransactionManagerPort` exposing only `transaction()`. `PostgresStoreAdapter`
+satisfies it structurally, so no additional adapter exists to keep in sync. C-25 holds.
+
+### correct vs supersede — the distinction this unit exists for
+
+|  | belief axis | world axis |
+|---|---|---|
+| `correct` | ENDS (`retracted_at`) | untouched |
+| `supersede` | CONTINUES | ENDS (`valid_to`) |
+
+If supersession retracted the old belief, "where did Priya live before Pune?" would have
+no answer. If correction left world validity in place, the system would assert that a
+fact it knows to be false was true for a period. Both directions are test-guarded.
+
+### Completion criterion met (in tests; live verification pending)
+
+`test_supersession_retains_both_states_across_time` — `state_at(February)` returns Pune,
+`state_at(June)` returns Bangalore, both rows retained with the earlier one bounded.
+
+`test_correction_makes_the_two_axes_diverge` — after correcting Google to Microsoft,
+`state_at(February)` returns Microsoft while `believed_at(February)` returns Google, and
+`comparison.differs` is True. This is the load-bearing assertion: a single-axis
+implementation cannot pass it, because two methods reading the same column can never
+disagree.
+
+### Implementation error found by a test, not by review
+
+The first `TimelineDiff` implementation derived `corrected` by comparing world state at
+the two endpoints. That cannot work: `state_at` excludes retracted facts, so a corrected
+fact is absent from **both** endpoints and the comparison detects nothing.
+
+Corrections must come from the belief axis. Required adding
+`BeliefRepositoryPort.transitions_between`. Recorded because the bug was invisible to
+inspection and only surfaced as a failing assertion.
+
+### Test helper corrected
+
+`test_schema_consistency` scanned only `CREATE TABLE` bodies and reported
+`facts.corrected_from` and `facts.supersedes` as missing from the migration. The test was
+wrong, not the migration: ADR-004 makes migrations forward-only, so a column added to an
+existing table can only ever appear in an `ALTER TABLE`. Extended with `added_columns`.
+Leaving the test as-is would have pushed toward rewriting an applied migration — exactly
+what forward-only prevents.
+
+### Wiring verified end to end, not just constructed
+
+`ConflictDetectionService` was initially built in `composition.py` but never called.
+A service can be fully correct, fully unit-tested, and never invoked. Added the call
+between extraction and commit in `api/conversation.py` — the only position where
+detection is useful, since running it after the write means the graph already holds both
+versions with no record that they disagree.
+
+`tests/integration/test_temporal_flow.py` exercises it through the HTTP endpoint:
+a temporal change supersedes and keeps both states; a contradiction reaches the user
+and neither version is discarded.
+
+### Constraints recorded
+
+- **C-26**: `correct` and `supersede` are distinct operations on distinct time axes.
+- **C-27**: `belief_history` and `memory_operations` are append-only. No update or
+  delete method may be added to their repositories. Test-guarded by asserting the
+  adapters expose no such method names.
+- **C-28**: a memory commit is ONE transaction spanning memory rows, provenance,
+  belief history, and the audit entry.
+
+### Test count
+
+240 → 269. New: `tests/unit/test_temporal_integrity.py` (23),
+`tests/integration/test_temporal_flow.py` (4), plus fake-repository additions.
+
+The atomicity tests are meaningful rather than decorative: `FakeTransactionManager`
+snapshots the fakes it manages and restores them if the body raises. Without that, a
+"failed commit leaves no trace" assertion would pass against dictionaries that never
+rolled back, testing nothing.
+
+### Status
+
+CODE COMPLETE, 269 tests passing offline. Migration 0003 not yet applied — awaiting
+activation on the Docker machine. Startup should report
+`migrations_up_to_date count=3` and `schema_drift_check_passed tables=15`.
+
+Not done in this unit, carried forward: user-facing provisional-entity review (Unit 6);
+belief history for events and relationships (schema supports it, only `fact` is
+written); live verification.

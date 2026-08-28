@@ -159,7 +159,45 @@ async def send_message(
         try:
             episode = await container.episodes.record_and_ingest(user_message)
             candidates = await container.extraction.extract(episode)
+
+            # Between extraction and commit — the only position where detection is
+            # useful. Running it after the write would mean the graph already held
+            # both versions with no record that they disagree (FR-05).
+            conflicts = await container.conflicts.detect(candidates)
+
             receipt = await container.memory.commit(candidates, episode)
+
+            # A temporal change ends an existing fact's world validity rather than
+            # contradicting it: "she moved in March" does not make "she lives in Pune"
+            # false, it bounds it. Superseding keeps the earlier state queryable
+            # (FR-04.4).
+            for change in container.conflicts.supersessions(conflicts):
+                try:
+                    await container.memory.supersede(
+                        change.existing_memory_id,
+                        new_statement=change.incoming_statement,
+                        effective_from=episode.occurred_at,
+                        reason=change.explanation,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # The new fact is already committed; a failed supersession leaves
+                    # the old one unbounded rather than losing anything.
+                    _log.warning(
+                        "supersession_failed",
+                        memory_id=str(change.existing_memory_id),
+                        error=str(exc)[:200],
+                        consequence="both states retained; old fact not bounded",
+                    )
+
+            contradictions = container.conflicts.contradictions(conflicts)
+            if contradictions:
+                # FR-05.6: surface, never resolve. The system holds two incompatible
+                # beliefs and must say so rather than quietly picking one.
+                notices.append(
+                    "Some of what you said conflicts with what I had recorded: "
+                    + "; ".join(c.explanation for c in contradictions[:3])
+                    + ". Both versions were kept."
+                )
 
             if receipt.needs_clarification:
                 # ADR-014: an ambiguous entity means this memory may be attached to

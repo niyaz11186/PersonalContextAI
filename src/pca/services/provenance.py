@@ -19,6 +19,7 @@ from pca.domain.memory import ProvenanceRef
 from pca.observability.logging import get_logger
 from pca.ports.clock import ClockPort
 from pca.ports.repositories import ConversationRepositoryPort, ProvenanceRepositoryPort
+from pca.ports.store import Transaction
 
 _log = get_logger(__name__)
 
@@ -35,13 +36,24 @@ class ProvenanceService:
         self._clock = clock
 
     async def record(
-        self, memory_id: MemoryId, kind: MemoryKind, ref: ProvenanceRef
+        self,
+        memory_id: MemoryId,
+        kind: MemoryKind,
+        ref: ProvenanceRef,
+        tx: Transaction | None = None,
     ) -> None:
+        """Link a memory to its source.
+
+        `tx` matters more here than anywhere else in the commit: a memory row that
+        lands without its provenance row is unfalsifiable — `_hydrate_facts` refuses
+        to return it, so the fact becomes invisible while still occupying the table.
+        """
         await self._repository.record(
             memory_id=memory_id,
             memory_kind=kind,
             ref=ref,
             recorded_at=self._clock.now(),
+            tx=tx,
         )
 
     async def chain(self, memory_id: MemoryId, kind: MemoryKind) -> Sequence[ProvenanceRef]:

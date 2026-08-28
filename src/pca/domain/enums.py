@@ -180,3 +180,21 @@ class MemoryKind(StrEnum):
     EVENT = "event"
     RELATIONSHIP = "relationship"
     ENTITY = "entity"
+
+
+class OperationKind(StrEnum):
+    """Every mutation recorded in the append-only operation log.
+
+    Specification §12 requires auditability of memory changes, and ADR-014 makes
+    entity merges reversible — reversal is only possible if the merge was recorded.
+    """
+
+    COMMIT = "commit"
+    CORRECT = "correct"
+    SUPERSEDE = "supersede"
+    RETRACT = "retract"
+    ENTITY_MERGE = "entity_merge"
+    SOURCE_DELETE = "source_delete"
+    MEMORY_DELETE = "memory_delete"
+    ERASE = "erase"
+    REINDEX = "reindex"

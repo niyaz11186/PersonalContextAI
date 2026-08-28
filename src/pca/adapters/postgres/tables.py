@@ -184,6 +184,11 @@ facts = Table(
     Column("temporal_method", Text, nullable=True),
     Column("temporal_anchor_zone", Text, nullable=True),
     Column("superseded_by", UUID(as_uuid=True), ForeignKey("facts.id"), nullable=True),
+    # 0003. Distinguishes the two ways a fact can be replaced. Without both columns
+    # the reason for a replacement is unrecoverable after the fact, and "we recorded
+    # it wrong" reads identically to "the world changed".
+    Column("corrected_from", UUID(as_uuid=True), ForeignKey("facts.id"), nullable=True),
+    Column("supersedes", UUID(as_uuid=True), ForeignKey("facts.id"), nullable=True),
     Column("created_at", TIMESTAMP(timezone=True), nullable=False),
 )
 
@@ -272,4 +277,68 @@ __all__ += [  # noqa: PLE0605 - extending the list defined above
     "facts",
     "provenance_index",
     "relationships",
+]
+
+# --------------------------------------------------------------- 0003, Unit 3
+
+# Append-only. `statement`, `valid_from`, and `valid_to` are snapshots rather than
+# references: a correction rewrites facts.statement, so a foreign key here would
+# resolve to the corrected text and the earlier belief would be lost — defeating the
+# only purpose this table has.
+belief_history = Table(
+    "belief_history",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column("memory_id", UUID(as_uuid=True), nullable=False),
+    Column("memory_kind", Text, nullable=False),
+    Column("cause", Text, nullable=False),
+    Column("asserted_at", TIMESTAMP(timezone=True), nullable=False),
+    Column("retracted_at", TIMESTAMP(timezone=True), nullable=True),
+    Column("statement", Text, nullable=False),
+    Column("valid_from", TIMESTAMP(timezone=True), nullable=True),
+    Column("valid_to", TIMESTAMP(timezone=True), nullable=True),
+    Column("superseded_by", UUID(as_uuid=True), nullable=True),
+    Column("reason", Text, nullable=True),
+    Column("recorded_at", TIMESTAMP(timezone=True), nullable=False),
+    CheckConstraint(
+        "memory_kind IN ('fact', 'event', 'relationship', 'entity')",
+        name="belief_history_kind_check",
+    ),
+    CheckConstraint(
+        "cause IN ('asserted', 'corrected', 'superseded', 'retracted', 'source_deleted')",
+        name="belief_history_cause_check",
+    ),
+    CheckConstraint(
+        "retracted_at IS NULL OR retracted_at >= asserted_at",
+        name="belief_history_window_ordered",
+    ),
+    Index("belief_history_window_idx", "asserted_at", "retracted_at"),
+    Index("belief_history_memory_idx", "memory_id", "memory_kind", "asserted_at"),
+)
+
+memory_operations = Table(
+    "memory_operations",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column("operation", Text, nullable=False),
+    Column("memory_id", UUID(as_uuid=True), nullable=True),
+    Column("memory_kind", Text, nullable=True),
+    Column("entity_id", UUID(as_uuid=True), nullable=True),
+    Column("episode_id", UUID(as_uuid=True), nullable=True),
+    Column("reason", Text, nullable=True),
+    Column("detail", JSONB, nullable=True),
+    Column("performed_at", TIMESTAMP(timezone=True), nullable=False),
+    CheckConstraint(
+        "operation IN ('commit', 'correct', 'supersede', 'retract', "
+        "'entity_merge', 'source_delete', 'memory_delete', 'erase', 'reindex')",
+        name="memory_operations_operation_check",
+    ),
+    Index("memory_operations_time_idx", "performed_at"),
+    Index("memory_operations_memory_idx", "memory_id"),
+    Index("memory_operations_entity_idx", "entity_id"),
+)
+
+__all__ += [  # noqa: PLE0605
+    "belief_history",
+    "memory_operations",
 ]

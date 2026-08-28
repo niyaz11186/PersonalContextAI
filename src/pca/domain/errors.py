@@ -52,3 +52,12 @@ class TemporalResolutionError(PcaError):
     Normal unresolvable references do not raise — they yield UNKNOWN granularity
     with null dates. This is only for callers that treat resolution as mandatory.
     """
+
+
+class MemoryNotFound(PcaError):
+    """A correction, supersession, or retraction named a memory that does not exist.
+
+    Raised rather than ignored. These operations are always deliberate — a user or
+    operator asserting something about a specific record — so silently doing nothing
+    would leave them believing a change had been applied when it had not.
+    """

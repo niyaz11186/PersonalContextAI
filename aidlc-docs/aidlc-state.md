@@ -4,8 +4,8 @@
 - **Project Type**: Greenfield
 - **Project Name**: Personal Context AI Assistant
 - **Start Date**: 2026-08-11T12:55:00+05:30
-- **Current Stage**: CONSTRUCTION - Unit 2 code complete (198 tests). Awaiting activation.
-- **Next Stage**: Unit 2 activation on the Docker machine, then Unit 3 (Temporal Integrity)
+- **Current Stage**: CONSTRUCTION - Unit 3 code complete (269 tests). Awaiting activation.
+- **Next Stage**: Unit 3 activation on the Docker machine (migration 0003), then Unit 4 (Retrieval Depth)
 - **Core hypothesis**: PROVEN 2026-08-24. A fact stated in one conversation was
   correctly recalled in a separate conversation without being repeated.
 - **Known quality gap**: recall is partial. See Unit 1b activation notes in audit.md.
@@ -56,9 +56,15 @@ all `gemini-2.5-*` (404, retired for new keys), `text-embedding-004` (nonexisten
 - [x] Unit 1b — Skeleton Activation — **COMPLETE 2026-08-24.** Completion criterion met:
       cross-conversation recall verified live. 132 tests passing.
       Top risk register entry retired: Graphiti + Gemini + Neo4j compose as documented.
-- [~] Unit 2 — Extraction Depth — CODE COMPLETE 2026-08-24, 198 tests passing offline.
-      Migration 0002 not yet applied; awaiting activation.
-- [ ] Unit 3 — Temporal Integrity
+- [x] Unit 2 — Extraction Depth — **COMPLETE 2026-08-24.** Verified live: facts, salience
+      categories, entities, and both time axes populated. 240 tests passing.
+- [~] Unit 3 — Temporal Integrity — CODE COMPLETE, 269 tests passing offline.
+      Completion criterion met in tests: supersession retains both states
+      (`state_at(Feb)` = Pune, `state_at(now)` = Bangalore), and after a correction
+      `believed_at` returns a DIFFERENT answer from `state_at` for the same date.
+      Commit is now atomic — the Unit 2 half-written-episode failure is test-guarded.
+      Migration 0003 not yet applied; awaiting activation.
+- [ ] Unit 4 — Retrieval Depth
 - [ ] Unit 4 — Retrieval Depth
 - [ ] Unit 5 — Orchestration Depth
 - [ ] Unit 6 — Management & Inspection
@@ -121,6 +127,9 @@ These are hard constraints, not preferences. Do not revisit without explicit use
 | C-23 | Graphiti telemetry MUST stay disabled (`GRAPHITI_TELEMETRY_ENABLED=false`) | 2026-08-22 |
 | C-24 | `openai` package is an unavoidable transitive dep of graphiti-core. C-2 is enforced as: no OpenAI key, no OpenAI import. | 2026-08-22 |
 | C-25 | Domain services depend on repository ports, never on RelationalStorePort | 2026-08-22 |
+| C-26 | `correct` and `supersede` are distinct operations on distinct time axes. Correct ends BELIEF; supersede ends WORLD validity. Never conflate. | 2026-08-25 |
+| C-27 | `belief_history` and `memory_operations` are append-only. No update or delete method may be added to their repositories. | 2026-08-25 |
+| C-28 | A memory commit is ONE transaction spanning memory rows, provenance, belief history, and the audit entry. | 2026-08-25 |
 
 ## Architecture Decisions (all settled)
 
