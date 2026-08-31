@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Protocol
 
 from pca.domain.conversation import Conversation, Episode, Message
-from pca.domain.enums import EntityType, MemoryKind, Role
+from pca.domain.enums import EntityType, ExtractionState, MemoryKind, Role
 from pca.domain.history import BeliefTransition, MemoryOperation
 from pca.domain.ids import (
     ConversationId,
@@ -26,6 +26,7 @@ from pca.domain.ids import (
     MessageId,
 )
 from pca.domain.memory import Entity, Event, Fact, ProvenanceRef, Relationship
+from pca.domain.orchestration import ExtractionRecord
 from pca.ports.store import Transaction
 
 # Write methods accept an optional `tx` so that a caller can compose several
@@ -392,3 +393,72 @@ class OperationLogRepositoryPort(Protocol):
     ) -> Sequence[MemoryOperation]: ...
 
     async def count(self) -> int: ...
+
+
+class ExtractionStatusRepositoryPort(Protocol):
+    """Durable extraction state backing the ADR-008 write barrier.
+
+    ADR-008 is explicit that an in-process lock is not sufficient: "if the process
+    dies mid-extraction, the pending episode must be recoverable on restart". These
+    rows are that record, and `ExtractionCoordinator`'s asyncio lock is an
+    optimisation layered on top rather than the mechanism itself.
+    """
+
+    async def claim(
+        self,
+        episode_id: EpisodeId,
+        conversation_id: ConversationId | None,
+        submitted_at: datetime,
+    ) -> bool:
+        """Register an episode for extraction. Returns False if already claimed.
+
+        This is the idempotency guarantee (ADR-008). The caller must not spawn work
+        when this returns False: an insert that collides on `episode_id` means some
+        other submit already owns this episode, and running anyway is exactly the
+        double-write the primary key exists to prevent.
+
+        Returning a bool rather than raising keeps a duplicate submit an ordinary
+        expected outcome, because after a crash-recovery restart it will be.
+        """
+        ...
+
+    async def mark_running(self, episode_id: EpisodeId, started_at: datetime) -> None:
+        """Increment the attempt count and move to RUNNING."""
+        ...
+
+    async def mark_finished(
+        self,
+        episode_id: EpisodeId,
+        state: ExtractionState,
+        finished_at: datetime,
+        error: str | None = None,
+    ) -> None: ...
+
+    async def get(self, episode_id: EpisodeId) -> ExtractionRecord | None: ...
+
+    async def in_flight_for_conversation(
+        self, conversation_id: ConversationId
+    ) -> Sequence[ExtractionRecord]:
+        """PENDING or RUNNING rows for one conversation. The barrier's only query.
+
+        Scoped to a conversation because ADR-008 requires the barrier be
+        per-conversation — a global query here would be the seed of a global lock,
+        letting one conversation's slow extraction delay every other.
+        """
+        ...
+
+    async def recoverable(self, limit: int = 100) -> Sequence[ExtractionRecord]:
+        """Rows left unfinished by a crash, oldest first.
+
+        Includes ABANDONED as well as PENDING and RUNNING: an abandoned extraction is
+        work the barrier stopped waiting for, not work that should be discarded.
+        """
+        ...
+
+    async def count_by_state(self) -> dict[str, int]:
+        """Backlog by state, for /health.
+
+        A stalled coordinator is otherwise invisible — the API keeps returning 200
+        and replies look normal while memory silently stops accumulating.
+        """
+        ...

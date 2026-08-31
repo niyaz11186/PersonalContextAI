@@ -61,3 +61,12 @@ class MemoryNotFound(PcaError):
     operator asserting something about a specific record — so silently doing nothing
     would leave them believing a change had been applied when it had not.
     """
+
+
+class ClarificationNotFound(PcaError):
+    """A resume named a clarification thread with no checkpoint.
+
+    Distinct from an already-answered one. A missing thread means the interrupt was
+    never recorded or its checkpoints were deleted, and answering into nothing would
+    tell the user their clarification was applied when no write occurred.
+    """

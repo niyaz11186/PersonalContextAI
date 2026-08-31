@@ -28,11 +28,14 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Index,
+    Integer,
+    LargeBinary,
     MetaData,
     String,
     Table,
     Text,
     TIMESTAMP,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
@@ -109,14 +112,19 @@ episodes = Table(
     Index("episodes_occurred_at_idx", "occurred_at"),
 )
 
+# Restructured by 0004 (Unit 5). The 0001 shape could not hold a LangGraph 1.2
+# checkpoint: no namespace, no metadata, and JSONB where the serde emits bytes.
 workflow_checkpoints = Table(
     "workflow_checkpoints",
     metadata,
     Column("thread_id", Text, primary_key=True),
+    Column("checkpoint_ns", Text, primary_key=True, server_default=""),
     Column("checkpoint_id", Text, primary_key=True),
     Column("parent_id", Text, nullable=True),
-    Column("workflow", Text, nullable=False),
-    Column("state", JSONB, nullable=False),
+    Column("workflow", Text, nullable=True),
+    Column("metadata", JSONB, nullable=False),
+    Column("type", Text, nullable=True),
+    Column("payload", LargeBinary, nullable=True),
     Column("created_at", TIMESTAMP(timezone=True), nullable=False),
 )
 
@@ -341,4 +349,75 @@ memory_operations = Table(
 __all__ += [  # noqa: PLE0605
     "belief_history",
     "memory_operations",
+]
+
+
+# ===========================================================================
+# Unit 5 — orchestration. Mirrors 0004_extraction_status.sql.
+# ===========================================================================
+
+extraction_status = Table(
+    "extraction_status",
+    metadata,
+    # episode_id, not a synthetic key: this IS the ADR-008 idempotency guarantee.
+    Column(
+        "episode_id",
+        UUID(as_uuid=True),
+        ForeignKey("episodes.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    # NULL for imported documents (Unit 7) — no conversation order to preserve.
+    Column(
+        "conversation_id",
+        UUID(as_uuid=True),
+        ForeignKey("conversations.id", ondelete="RESTRICT"),
+        nullable=True,
+    ),
+    Column("state", Text, nullable=False),
+    Column("attempts", Integer, nullable=False, server_default="0"),
+    Column("submitted_at", TIMESTAMP(timezone=True), nullable=False),
+    Column("started_at", TIMESTAMP(timezone=True), nullable=True),
+    Column("finished_at", TIMESTAMP(timezone=True), nullable=True),
+    Column("error", Text, nullable=True),
+    Column("updated_at", TIMESTAMP(timezone=True), nullable=False),
+    CheckConstraint(
+        "state IN ('pending', 'running', 'succeeded', 'failed', 'abandoned')",
+        name="extraction_status_state_check",
+    ),
+    CheckConstraint(
+        "finished_at IS NULL OR started_at IS NULL OR finished_at >= started_at",
+        name="extraction_status_finished_ordered",
+    ),
+    Index(
+        "extraction_status_barrier_idx",
+        "conversation_id",
+        postgresql_where=text("state IN ('pending', 'running')"),
+    ),
+    Index("extraction_status_recovery_idx", "state", "submitted_at"),
+)
+
+workflow_checkpoint_writes = Table(
+    "workflow_checkpoint_writes",
+    metadata,
+    Column("thread_id", Text, primary_key=True),
+    Column("checkpoint_ns", Text, primary_key=True, server_default=""),
+    Column("checkpoint_id", Text, primary_key=True),
+    Column("task_id", Text, primary_key=True),
+    Column("idx", Integer, primary_key=True),
+    Column("channel", Text, nullable=False),
+    Column("type", Text, nullable=True),
+    Column("payload", LargeBinary, nullable=True),
+    Column("task_path", Text, nullable=False, server_default=""),
+    Column("created_at", TIMESTAMP(timezone=True), nullable=False),
+    Index(
+        "workflow_checkpoint_writes_thread_idx",
+        "thread_id",
+        "checkpoint_ns",
+        "checkpoint_id",
+    ),
+)
+
+__all__ += [  # noqa: PLE0605
+    "extraction_status",
+    "workflow_checkpoint_writes",
 ]

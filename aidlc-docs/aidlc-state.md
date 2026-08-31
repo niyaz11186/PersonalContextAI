@@ -4,8 +4,8 @@
 - **Project Type**: Greenfield
 - **Project Name**: Personal Context AI Assistant
 - **Start Date**: 2026-08-11T12:55:00+05:30
-- **Current Stage**: CONSTRUCTION - Unit 4 code complete (310 tests). Awaiting activation.
-- **Next Stage**: Unit 4 activation on the Docker machine, then Unit 5 (Orchestration Depth)
+- **Current Stage**: CONSTRUCTION - Unit 5 Code Generation Part 1 (Planning). Plan written, awaiting approval. Unit 4 code complete (314 tests), not yet activated live.
+- **Next Stage**: Approve the Unit 5 plan, then Code Generation Part 2. Unit 4 live activation still outstanding.
 - **Core hypothesis**: PROVEN 2026-08-24. A fact stated in one conversation was
   correctly recalled in a separate conversation without being repeated.
 - **Known quality gap**: recall is partial. See Unit 1b activation notes in audit.md.
@@ -42,6 +42,17 @@ all `gemini-2.5-*` (404, retired for new keys), `text-embedding-004` (nonexisten
 | Resiliency Baseline | Yes | Requirements Analysis |
 | Property-Based Testing | No | Requirements Analysis |
 
+**Enforcement note (2026-08-31)**: The Resiliency Baseline was enabled but its rules file was
+never loaded during Units 1a–4 — no stage before Unit 5 carries a resiliency compliance summary.
+The first review, run at Unit 5 planning, found RESILIENCY-10 breached by existing code. Load
+`extensions/resiliency/baseline/resiliency-baseline.md` at every subsequent stage.
+
+**Unresolved**: Question 17 presented the extension as "directional best practices"; the extension
+file declares its own rules "blocking by default". The user's answer began "Not sure" — a vague
+marker that `common/overconfidence-prevention.md` requires be followed up, and never was.
+Enforcement strength is therefore still undefined. Open resiliency questions are in §9 of the
+Unit 5 plan.
+
 ## Stage Progress
 ### INCEPTION PHASE
 - [x] Workspace Detection - Completed 2026-08-11
@@ -71,6 +82,21 @@ all `gemini-2.5-*` (404, retired for new keys), `text-embedding-004` (nonexisten
       fixed Graphiti's empty-query gate silently disabling `search_temporal` and
       `traverse` (310 → 314 tests). Awaiting live activation.
 - [ ] Unit 5 — Orchestration Depth
+      - [x] Conditional-stage assessment — Functional Design, NFR Requirements, NFR Design and
+            Infrastructure Design all SKIPPED. Rationale in audit.md and in the plan §2.
+      - [x] Code Generation Part 1 (Planning) — plan at
+            `aidlc-docs/construction/plans/unit-5-orchestration-depth-code-generation-plan.md`.
+            18 steps. D-1..D-6 answered by delegation 2026-08-31 (B, A, C, B+C, A, A).
+            Pre-planning source check of `langgraph==1.2.11` found that the
+            `workflow_checkpoints` table from migration 0001 cannot hold a LangGraph 1.2
+            checkpoint — no `checkpoint_ns`, no `metadata`, no pending-writes table, and
+            `state JSONB` is the wrong type for serde output. Migration 0004 restructures it.
+            Resiliency Baseline review (revision 2) found RESILIENCY-10 non-compliant:
+            no timeout on any Gemini or Graphiti call anywhere in the codebase, and the
+            bounded-concurrency semaphore that `services.md` specifies for
+            `GeminiProviderAdapter` was never built in Unit 1a. Remediated by Step 6b.
+            No blocking findings remain.
+      - [ ] Code Generation Part 2 (Generation)
 - [ ] Unit 6 — Management & Inspection
 - [ ] Unit 7 — Lifecycle & Hardening
 - [ ] Build and Test

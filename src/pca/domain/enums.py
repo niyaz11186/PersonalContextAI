@@ -198,3 +198,52 @@ class OperationKind(StrEnum):
     MEMORY_DELETE = "memory_delete"
     ERASE = "erase"
     REINDEX = "reindex"
+
+
+class Intent(StrEnum):
+    """What the user is asking the system to do (FR-02.6).
+
+    Routing to the wrong one is not a neutral mistake: sending a correction down the
+    conversation path leaves the wrong memory in place while the reply implies it was
+    fixed. That is why `IntentRouter` reports a confidence and routes uncertainty to
+    CLARIFY instead of picking the most likely option.
+    """
+
+    CONVERSE = "converse"
+    CORRECT = "correct"
+    FORGET = "forget"
+    HISTORICAL = "historical"
+    CLARIFY = "clarify"
+
+
+class ExtractionState(StrEnum):
+    """Durable lifecycle of a background extraction (ADR-008).
+
+    ABANDONED is distinct from FAILED on purpose. FAILED means extraction ran and
+    could not finish; ABANDONED means the barrier stopped waiting and the reader
+    proceeded with a disclosure. The work is still valid and still recoverable, so
+    treating the two alike would either retry genuine failures forever or discard
+    work that merely ran late.
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    ABANDONED = "abandoned"
+
+
+class DegradationAction(StrEnum):
+    """What a caller should do when a dependency is unavailable (NFR-06.5)."""
+
+    PROCEED_WITHOUT_MEMORY = "proceed_without_memory"
+    PROCEED_WITH_INCOMPLETE_MEMORY = "proceed_with_incomplete_memory"
+    FAIL_REQUEST = "fail_request"
+
+
+class ClarificationStatus(StrEnum):
+    """Where an interrupted clarification has got to (ADR-006, ADR-014)."""
+
+    AWAITING_ANSWER = "awaiting_answer"
+    RESOLVED = "resolved"
+    ABANDONED = "abandoned"

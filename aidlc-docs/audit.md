@@ -1272,3 +1272,206 @@ existing `uuid` regression test. 310 → 314.
 **Context**: Read-only status report. Corrected two stale entries in aidlc-state.md — a duplicate unchecked `Unit 4 — Retrieval Depth` line left over from the original unit list, and the test count (310 → 314 after the pre-Unit-5 empty-query fix).
 
 ---
+
+## CONSTRUCTION — Unit 5 Orchestration Depth — Code Generation PART 1 (Planning)
+**Timestamp**: 2026-08-31T00:00:00Z
+**User Input**: "please start unit 5 development/implementation"
+**AI Response**: Entered the Unit 5 per-unit Construction loop. Performed the conditional-stage
+assessment, then produced the Part 1 code generation plan at
+`aidlc-docs/construction/plans/unit-5-orchestration-depth-code-generation-plan.md` with 17
+numbered steps and 6 blocking decisions embedded as `[Answer]:` tags. Awaiting approval before
+any code is written.
+**Context**: Code Generation Part 1 of 2. No source files modified.
+
+### Conditional-stage assessment for Unit 5
+
+| Stage | Decision | Reason |
+|---|---|---|
+| Functional Design | SKIP | The business logic is already fixed by inception artifacts at method-signature granularity: `component-methods.md` gives `IntentRouter.classify`, all five workflow entry points, `ExtractionCoordinator.submit`/`await_barrier`/`recover_pending`, and the three `DegradationPolicy` methods; `services.md` gives node-by-node tables for all five workflows plus the conflict-branch action table and the correct-vs-supersede rule. Re-deriving them would restate, not decide. Same basis on which Units 2, 3 and 4 skipped it. |
+| NFR Requirements | SKIP | Unit 5's NFRs are already named and bound: NFR-02.3 (extraction off the response path) is the unit's completion condition, NFR-06.1/06.5 map to `DegradationPolicy` in `unit-of-work-requirements-map.md`, and ADR-008 fixes the barrier's timeout, durability, and idempotency constraints. Tech stack was settled in Unit 1. |
+| NFR Design | SKIP | Follows the above — no NFR requirement is open. |
+| Infrastructure Design | SKIP | No new infrastructure. Checkpointing reuses the PostgreSQL instance already in the Compose stack (NFR-05.2), and the background extraction queue is in-process per ADR-008's single-user scope. |
+| Code Generation | EXECUTE | Always executes. Both parts. |
+
+The genuinely open decisions are not design-stage questions but implementation choices, so they
+are carried into the code generation plan as blocking `[Answer]:` tags rather than deferred to a
+stage that would otherwise produce no new content.
+
+### Pre-planning source verification (installed packages, not documentation)
+
+Following the practice that found the Unit 1b `uuid`, Unit 4 `center_node_uuid`, and pre-Unit-5
+empty-query defects, `langgraph==1.2.11` was inspected in the venv before planning:
+
+- `BaseCheckpointSaver.__abstractmethods__` is `None` — subclassing is viable without
+  implementing the full surface. Async methods needed: `aget_tuple`, `alist`, `aput`,
+  `aput_writes`, `adelete_thread`.
+- `langgraph.types` exports `interrupt` and `Command`, so the ClarificationWorkflow
+  interrupt/resume pair is supported as ADR-006 assumed.
+- **Finding: the `workflow_checkpoints` table authored in `0001_foundation.sql` cannot store a
+  LangGraph 1.2 checkpoint.** It has no `checkpoint_ns` column (so parallel/nested namespaces
+  collide on the primary key), no `metadata` column, and no companion table for `put_writes`
+  pending writes. Its `state JSONB NOT NULL` column is also the wrong type: LangGraph's serde
+  emits `(type: str, payload: bytes)`, which is BYTEA, not JSONB. The table has never been
+  written to — Unit 1b compiled the graph without a checkpointer — so `0004` can restructure it
+  rather than work around it. Had this not been checked first, the defect would have surfaced as
+  a failed resume after a restart, which is precisely Unit 5's completion criterion.
+- **Design consequence**: `langgraph-checkpoint-postgres` is rejected. It requires `psycopg`,
+  which would put a second PostgreSQL driver and a second connection pool alongside the existing
+  asyncpg one. The checkpointer is instead split across two layers to keep both boundary rules
+  intact: `CheckpointStorePort` + a SQLAlchemy adapter (no langgraph import), and
+  `PostgresCheckpointSaver` in `orchestration/` (no sqlalchemy import).
+
+---
+
+## PROCESS SELF-AUDIT — AI-DLC compliance check requested before Unit 5 Part 2
+**Timestamp**: 2026-08-31T00:00:00Z
+**User Input**: "ok approved for code generation, before we go ahead, can you please tell are you follwing the AIDLC framework? Tell first dont code yet"
+**AI Response**: Performed an evidence-based self-audit of AI-DLC adherence for the Unit 5 planning
+stage. Found three deviations, one material. No code written. Part 2 held.
+**Context**: Code Generation Part 1, post-approval verification.
+
+### Deviation 1 — wrong rule-details path (verified harmless)
+
+Read rule details from `aidlc-rules/aws-aidlc-rule-details/` rather than `.aidlc-rule-details/`,
+which is the second entry in the documented resolution order and the first one that exists.
+Path was chosen by pattern-matching the workspace tree instead of following the documented order.
+Verified by MD5 comparison of both trees: 31 files each, byte-identical. No content impact.
+
+### Deviation 2 — mandatory common rules never loaded
+
+`common/process-overview.md`, `common/session-continuity.md`, `common/content-validation.md` and
+`common/question-format-guide.md` are listed as ALWAYS-load at workflow start. None were read.
+The question format used in the Unit 5 plan was inferred from the summary in
+`.github/copilot-instructions.md` rather than from the guide itself. `common/depth-levels.md` and
+`common/overconfidence-prevention.md` were also never read in this project.
+
+### Deviation 3 — MATERIAL — enabled Resiliency Baseline extension not loaded or enforced
+
+`aidlc-docs/aidlc-state.md` records `Resiliency Baseline | Yes`. The extension loading procedure
+requires that an opted-in extension's full rules file be loaded and enforced, that applicable
+rules be evaluated at each stage, and that the stage completion message carry a compliance
+summary (compliant / non-compliant / N/A per rule) with non-compliance treated as blocking.
+
+`extensions/resiliency/baseline/resiliency-baseline.md` was not loaded before the Unit 5 plan was
+written, and the Part 1 completion message contained no Resiliency Findings section.
+
+This is the worst unit in which to have missed it. Unit 5 IS the resiliency unit — barrier
+timeouts, degradation with disclosure, crash recovery, background work, and resume-after-restart
+are its entire content. The rules were not applied to the stage they most directly govern.
+
+**Compounding ambiguity, unresolved since Inception.** Question 17 presented the extension as
+"directional, design-time best practices and guidance". The user's recorded answer was freeform:
+"Not sure, I dont want the project built with mess I want standards, even tho it is an
+experminetal project" — logged as Yes. But the extension file states its own rules are "blocking
+by default". Directional guidance and blocking constraints are different enforcement regimes and
+the difference was never settled with the user.
+
+**Inherited gap found while checking this.** RESILIENCY-02 requires an RTO/RPO and DR-strategy
+question to be put to the user before requirements are finalised. No such question appears in
+`requirement-verification-questions.md` and no RTO/RPO target appears anywhere in
+`aidlc-docs/`. Unit 7's `BackupService` (ADR-013) has no recovery target to design against.
+
+### Approval status — NOT sufficient to start Part 2
+
+The user's message says "approved for code generation", but decisions D-1 through D-6 in the plan
+are still unanswered. `construction/code-generation.md` Step 7 requires approval to cover the
+entire plan. D-1 (barrier placement) and D-3 (clarification resume path) change what gets built,
+not merely how. Applying the recommended answers unasked would violate the stated AI-DLC
+principle that architectural decisions belong to the user rather than the model. Held pending
+explicit answers or explicit delegation.
+
+---
+
+## PROCESS REMEDIATION + RESILIENCY REVIEW — Unit 5 plan revised
+**Timestamp**: 2026-08-31T00:00:00Z
+**User Input**: "ok do it"
+**AI Response**: Interpreted as accepting both offers made in the preceding message: option 1
+(delegate D-1..D-6 to the recommended answers) and option (a) (load the resiliency baseline and
+re-run the Unit 5 plan against it before Part 2). Loaded the previously-missed rule files,
+evaluated all 15 RESILIENCY rules against the Unit 5 plan, found one material defect, revised the
+plan. Still no code written.
+**Context**: Code Generation Part 1, revision 2.
+
+### Deviations 1 and 2 closed
+
+Rule details now read from `.aidlc-rule-details/` (the documented path). Loaded
+`common/question-format-guide.md` and `common/overconfidence-prevention.md`.
+
+Two format defects in the original plan, found by finally reading the guide:
+
+- Every question must carry `X) Other (please describe after [Answer]: tag below)` as the LAST
+  option. None of D-1..D-6 had it. Fixed.
+- Options must be separated by blank lines so strict CommonMark renderers do not collapse them
+  into one paragraph. Fixed — the bullet-list form used originally was also non-conforming.
+
+`overconfidence-prevention.md` names the vague-response markers that must trigger a follow-up:
+"depends", "maybe", **"not sure"**, "mix of". The Question 17 answer on the resiliency extension
+begins with the exact phrase "Not sure". Under this rule it should have produced a clarification
+file at Requirements time, which would have settled the directional-versus-blocking ambiguity
+before any code was written. It did not.
+
+### D-1..D-6 recorded as DELEGATED
+
+B, A, C, B+C, A, A. Marked `(delegated)` in the plan rather than as user-authored answers, so a
+later reader can tell which choices carry the user's judgement and which carry the model's.
+D-2 subsequently amended by the review below.
+
+### RESILIENCY-10 — material finding, verified against source
+
+The review earned its place. Three of four RESILIENCY-10 sub-rules were breached, two of them by
+code that already exists:
+
+**Unbounded waits.** Read the adapters directly rather than trusting the plan.
+`GeminiProviderAdapter._with_retry` treats the substring "timeout" in an exception message as a
+retry signal but never sets a timeout. `GraphitiMemoryAdapter` contains no timeout of any kind.
+**Every model and graph call in this system is currently an unbounded wait**, which RESILIENCY-10
+forbids outright. The retrieval budget governor masked this on the read path since Unit 4;
+nothing masks it on the write path.
+
+**Missing bulkhead — a defect in my own plan.** D-2 chose `asyncio.create_task` per extraction
+with no concurrency bound. A burst of messages would spawn unbounded concurrent Gemini calls; on
+hitting the free-tier rate limit, *every* conversation's barrier times out simultaneously. One
+saturated dependency degrading the entire write path at once is precisely the failure the
+bulkhead rule exists to prevent, and the per-conversation barrier design would not have contained
+it.
+
+**The fix was already specified and never built.** `services.md` §Concurrency Model states:
+"Gemini rate limits | Bounded concurrency semaphore in `GeminiProviderAdapter`, with backoff".
+The backoff shipped in Unit 1a. The semaphore did not. It went unnoticed for four units because
+until now every model call sat on the request path and was therefore serialised by one user
+typing — an accidental limit that Unit 5's background extraction removes. This is the same class
+of defect as the Unit 1b `uuid` and Unit 4 `center_node_uuid` bugs: correct-looking code, green
+tests, wrong against the real system.
+
+**Remediation**: new Step 6b (provider semaphore, explicit timeouts on Gemini and Graphiti, three
+new settings, documented free-tier quota budget), two new bullets on Step 6 (bounded task pool,
+per-extraction wall-clock timeout distinct from the barrier timeout), and
+`tests/unit/test_resiliency_bounds.py` asserting peak observed concurrency rather than the mere
+existence of a semaphore.
+
+**Circuit breakers**: deliberately still absent. With one provider and no fallback (C-11), a
+tripped breaker and a failed call give the user the same outcome, and retry/backoff plus the new
+semaphore already prevent the hammering a breaker would stop. Recorded as a decision, not an
+oversight.
+
+### Other findings
+
+- **RESILIENCY-09**: Gemini free-tier quota was never documented despite having already been hit
+  once (it drove the `-lite` model workaround). Unit 5 raises per-turn call count. Added to
+  Step 6b.
+- **RESILIENCY-04**: forward-only migrations (ADR-004) mean migration 0004 has no automated
+  reversal, and no backup exists until Unit 7. Mitigated only by `workflow_checkpoints` being
+  empty. Raised as §9 Question 2.
+- **RESILIENCY-02**: RTO/RPO still undefined. Blocks Unit 7, not Unit 5. Raised as §9 Question 1.
+- **RESILIENCY-12**: ADR-013 does not mention backup encryption at rest. Flagged for Unit 7.
+
+### Compliance summary for this stage
+
+Compliant: RESILIENCY-06. Partial: 01, 05, 07, 09 (addressed), 14. N/A: 08 (genuinely — local
+single-machine by C-10), 03, 04, 11, 12, 13, 15 (stage scope, owned by Unit 7 / Operations).
+Non-compliant: 02 (inherited, does not constrain Unit 5 code).
+
+**Blocking findings for Unit 5 Code Generation: none remaining.** Four questions raised in §9 for
+the user; none block this unit.
+
+---
