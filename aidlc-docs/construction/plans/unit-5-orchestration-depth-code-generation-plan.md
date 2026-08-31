@@ -396,12 +396,24 @@ that accidental limit.
       budget that Unit 5 implies (RESILIENCY-09 service quota awareness)
 
 ### Step 7 — `IntentRouter` (L2)
-- [ ] `src/pca/orchestration/intent_router.py`
-- [ ] `classify(message, conversation_id) -> RoutingDecision` per D-4
-- [ ] Low confidence routes to clarification rather than guessing (`unit-of-work.md` §Routing)
-- [ ] FR-02.6 command recognition: *forget that*, *that's wrong*, *actually…* — classify only;
-      *forget* execution stays in Unit 6, so `Intent.FORGET` returns a "not yet available"
-      disclosure rather than silently doing nothing
+- [x] `src/pca/orchestration/intent_router.py`
+- [x] `classify(message, conversation_id) -> RoutingDecision` per D-4: deterministic prefilter
+      first, escalating to the small model only for what survives it
+- [x] Low confidence routes to clarification rather than guessing (`unit-of-work.md` §Routing)
+- [x] FR-02.6 command recognition: *forget that*, *that's wrong*, *actually…* — classify only;
+      *forget* execution stays in Unit 6
+- [x] `has_open_clarification` short-circuit — the D-3 in-band half. Checked before the prefilter,
+      because an answer can look like any other intent: "no, the one from work" would otherwise
+      match the correction pattern
+- [x] Prefilter tuned conservatively in one direction. Escalating an obvious message wastes a
+      call; matching ordinary conversation routes a real question into a workflow that cannot
+      answer it. Patterns anchor at the start, and FORGET additionally requires a short message
+- [x] Classifier failure defaults to CONVERSE, not CLARIFY. Defaulting to clarification would
+      interrogate the user on every turn while the provider is unwell — worse than the behaviour
+      of the previous four units
+- [x] `tests/unit/test_intent_router.py` (18 tests). **Caught a real defect**: the alternation
+      group `(i|it|she|he|they)` had no trailing `\b`, so it matched the "i" inside "is" and
+      "Actually is a word I overuse" prefiltered as a correction. Every group now ends in `\b`
 
 ### Step 8 — `ExtractionWorkflow` (L2)
 - [ ] `src/pca/orchestration/extraction_workflow.py`, nodes per `services.md` Workflow 2:
