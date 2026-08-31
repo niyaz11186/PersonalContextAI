@@ -77,6 +77,10 @@ class FakeMemoryGraph:
     # ---------------------------------------------------------------- writes
 
     async def add_episode(self, episode: Episode) -> GraphIngestResult:
+        # Guarded like the search strategies so `fail_strategies={"add_episode"}`
+        # can exercise the ADR-005 path where the graph is down but PostgreSQL is
+        # authoritative and the commit must still proceed.
+        self._guard("add_episode")
         self.episodes.append(episode)
         self.hits.append(
             GraphHit(

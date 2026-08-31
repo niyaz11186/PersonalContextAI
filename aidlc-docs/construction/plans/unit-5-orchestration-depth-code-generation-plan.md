@@ -416,15 +416,35 @@ that accidental limit.
       "Actually is a word I overuse" prefiltered as a correction. Every group now ends in `\b`
 
 ### Step 8 — `ExtractionWorkflow` (L2)
-- [ ] `src/pca/orchestration/extraction_workflow.py`, nodes per `services.md` Workflow 2:
-      load episode → extract → resolve entities → retrieve related → detect conflicts → branch →
-      commit → record belief → log operation
-- [ ] Conflict branch actions exactly as tabulated: `AGREEMENT` reinforce, `REFINEMENT` attach,
-      `TEMPORAL_CHANGE` supersede with `effective_from`, `CONTRADICTION` commit as uncertain and
-      flag for surfacing — **never** pick a winner (FR-05.6)
-- [ ] Idempotent by `episode_id` (ADR-008), enforced through `extraction_status`
-- [ ] **Move**, not copy, the memory-write logic out of `api/conversation.py`. Leaving a second
-      copy behind is how the two drift and a fix lands in only one of them
+- [x] `src/pca/orchestration/extraction_workflow.py`, nodes per `services.md` Workflow 2:
+      load → ingest → extract → detect conflicts → commit → reconcile
+- [x] Conflict branch actions exactly as tabulated: `TEMPORAL_CHANGE` supersedes with
+      `effective_from`, `CONTRADICTION` is surfaced and flagged — **never** pick a winner
+      (FR-05.6). `AGREEMENT` and `REFINEMENT` need no action; the candidate is already committed
+      and the corroboration appears as an extra provenance link
+- [x] Idempotent by `episode_id` (ADR-008)
+- [~] **Move**, not copy, the memory-write logic out of `api/conversation.py`. **Currently a
+      copy, not a move** — the workflow exists and the router's inline version is still the only
+      one that runs. Nothing calls the workflow yet, so there is no double-write today, but the
+      logic is genuinely duplicated until Step 12 deletes the original. Tracked here rather than
+      marked done, because "we'll remove the old one later" is exactly how two copies drift
+- [x] Graph ingestion relocated into this workflow. The router now persists the episode to
+      PostgreSQL and returns; ingestion fans out to Gemini through Graphiti, so leaving it on the
+      request path would have kept most of the latency this unit exists to remove. ADR-005's
+      ordering is unaffected — PostgreSQL first, graph second
+- [x] **Idempotency implemented in the workflow, not only the coordinator.** The
+      `extraction_status.episode_id` primary key prevents duplicate *submits*; it does nothing
+      about a crash between `commit` and marking the row finished. Recovery re-runs that episode,
+      and without a check every fact would be written a second time. `_load` consults
+      `provenance.memories_from_episode` and short-circuits to END
+- [x] Two short circuits: already-committed, and nothing-extracted. The second avoids spending a
+      classifier call and a transaction to write an empty candidate set
+- [x] A missing episode raises rather than returning an empty outcome — the coordinator records
+      FAILED, where swallowing it would mark the extraction SUCCEEDED and never retry
+- [x] `tests/unit/test_extraction_workflow.py` (10 tests). **Caught a vacuous test of my own**:
+      `harness.graph.fail_next_add = True` set an attribute `FakeMemoryGraph` does not have, so
+      the graph-failure test asserted nothing. `add_episode` now honours the existing
+      `fail_strategies` switch, and the test asserts ingestion was attempted and refused
 
 ### Step 9 — `CorrectionWorkflow` (L2)
 - [ ] `src/pca/orchestration/correction_workflow.py`, nodes per `services.md` Workflow 3
