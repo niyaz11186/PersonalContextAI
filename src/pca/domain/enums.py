@@ -247,3 +247,17 @@ class ClarificationStatus(StrEnum):
     AWAITING_ANSWER = "awaiting_answer"
     RESOLVED = "resolved"
     ABANDONED = "abandoned"
+
+
+class CorrectionStatus(StrEnum):
+    """Outcome of a correction attempt.
+
+    AWAITING_CONFIRMATION is a success, not a failure. C-26 makes `correct` and
+    `supersede` irreversible in different directions, and choosing wrong corrupts the
+    timeline in a way that is hard to detect later — so asking is the correct
+    behaviour whenever the signal is weak or more than one memory is affected.
+    """
+
+    APPLIED = "applied"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
+    NOTHING_TO_CORRECT = "nothing_to_correct"

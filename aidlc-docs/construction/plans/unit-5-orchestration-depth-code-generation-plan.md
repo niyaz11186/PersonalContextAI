@@ -447,13 +447,31 @@ that accidental limit.
       `fail_strategies` switch, and the test asserts ingestion was attempted and refused
 
 ### Step 9 — `CorrectionWorkflow` (L2)
-- [ ] `src/pca/orchestration/correction_workflow.py`, nodes per `services.md` Workflow 3
-- [ ] The correct-vs-supersede decision (C-26): *"that's not what I said"* → `correct`;
+- [x] `src/pca/orchestration/correction_workflow.py`, nodes per `services.md` Workflow 3:
+      identify → plan → confirm (conditional) → apply
+- [x] The correct-vs-supersede decision (C-26): *"that's not what I said"* → `correct`;
       *"she moved in March"* → `supersede`. When the signal is weak the workflow **confirms via
-      interrupt** rather than inferring — choosing wrong corrupts the timeline in a way that is
-      hard to detect later
-- [ ] Interrupt when more than one memory is affected ("confirm scope" node)
-- [ ] Calls existing `MemoryService.correct` / `.supersede` — no new write path
+      interrupt** rather than inferring
+- [x] Interrupt when more than one memory is affected ("confirm scope" node) — picking whichever
+      ranked first is a guess about which record the user meant, and a wrong guess silently
+      retracts a fact they never mentioned
+- [x] Calls existing `MemoryService.correct` / `.supersede` — no new write path
+- [x] Confidence threshold set at 0.75, deliberately above the intent router's 0.6. Routing
+      wrongly costs a wasted turn; correcting on the wrong axis costs the timeline
+- [x] A dead planner produces AWAITING_CONFIRMATION, not a default axis. Unlike conflict
+      detection this cannot proceed without the model, because the operation *is* the decision
+- [x] An unrecognised confirmation answer takes the conservative axis (`correct`). Correcting
+      only ends a belief; superseding asserts a world change that may never have happened
+- [x] `effective_from` resolved via `TimeReference` + `TimeResolver` per ADR-010 — the model
+      returns a descriptor with no date in it and our code computes. Unresolvable phrases fall
+      back to now rather than a fabricated date, matching the automatic supersession path
+- [x] Candidates filtered to active facts: correcting an already-retracted fact would open a
+      second belief window on a record nobody currently believes
+- [x] `tests/unit/test_correction_workflow.py` (13 tests). `test_correct_and_supersede_touch_
+      different_axes` asserts *which timestamp moved* on each path — asserting merely that
+      "something was written" would pass with the axes swapped. The restart test additionally
+      asserts the planner was **not** consulted again, which is what distinguishes restored
+      state from recomputed state; without it the test passes even if resume re-ran the graph
 
 ### Step 10 — `HistoricalAnalysisWorkflow` (L2)
 - [ ] `src/pca/orchestration/historical_workflow.py`, nodes per `services.md` Workflow 4

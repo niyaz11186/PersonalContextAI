@@ -17,9 +17,11 @@ from datetime import datetime, timedelta
 
 from pca.domain.enums import (
     ClarificationStatus,
+    CorrectionStatus,
     DegradationAction,
     ExtractionState,
     Intent,
+    OperationKind,
 )
 from pca.domain.ids import ConversationId, EpisodeId, MemoryId
 
@@ -126,6 +128,23 @@ class CorrectionRequest:
     statement: str
     reason: str
     memory_id: MemoryId | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectionResult:
+    """Outcome of running the correction workflow.
+
+    `thread_id` is returned even when nothing was applied, because an
+    AWAITING_CONFIRMATION result is resumable and the id is the only handle to it.
+    """
+
+    status: CorrectionStatus
+    thread_id: str
+    operation: OperationKind | None = None
+    original_id: MemoryId | None = None
+    replacement_id: MemoryId | None = None
+    question: str | None = None
+    options: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
