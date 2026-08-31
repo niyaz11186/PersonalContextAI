@@ -63,12 +63,13 @@ all `gemini-2.5-*` (404, retired for new keys), `text-embedding-004` (nonexisten
       and `memory_operations` populating. Completion criterion met in tests.
       **Supersede/correct not yet exercised live** — no HTTP endpoint until Unit 6,
       so the only live trigger is automatic supersession via conflict detection.
-- [~] Unit 4 — Retrieval Depth — CODE COMPLETE, 310 tests passing offline.
+- [~] Unit 4 — Retrieval Depth — CODE COMPLETE, 314 tests passing offline.
       Five strategies genuinely distinct (each an explicit Graphiti SearchConfig),
       RRF fusion, seeded traversal, capped cross-encoder rerank, governor with a real
       stop condition. `RetrievalResult.facts` now populated from PostgreSQL per
-      ADR-015 — it was always empty through Units 1b–3. Awaiting live activation.
-- [ ] Unit 4 — Retrieval Depth
+      ADR-015 — it was always empty through Units 1b–3. Pre-Unit-5 audit found and
+      fixed Graphiti's empty-query gate silently disabling `search_temporal` and
+      `traverse` (310 → 314 tests). Awaiting live activation.
 - [ ] Unit 5 — Orchestration Depth
 - [ ] Unit 6 — Management & Inspection
 - [ ] Unit 7 — Lifecycle & Hardening

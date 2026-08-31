@@ -1262,3 +1262,13 @@ existing `uuid` regression test. 310 → 314.
 - `invalidate_edge`/`entity_divergence` remain `NotImplementedError` — genuinely
   unneeded until Units 3(retroactively)/7 wire them, but comments should be corrected
   to stop claiming a unit that already shipped.
+
+---
+
+## Status Query — Current Stage
+**Timestamp**: 2026-08-31T00:00:00Z
+**User Input**: "Using AIDLC here, please tell what is the current stage of our AIDLC based project"
+**AI Response**: Reported current stage from aidlc-state.md and audit.md: INCEPTION complete; CONSTRUCTION in progress; Units 1a, 1b, 2, 3 complete; Unit 4 (Retrieval Depth) CODE COMPLETE at 314 offline tests, awaiting live activation on the Docker machine; Units 5–7 and Build and Test not started. No stage transition performed.
+**Context**: Read-only status report. Corrected two stale entries in aidlc-state.md — a duplicate unchecked `Unit 4 — Retrieval Depth` line left over from the original unit list, and the test count (310 → 314 after the pre-Unit-5 empty-query fix).
+
+---
