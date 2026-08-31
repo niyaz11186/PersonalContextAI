@@ -23,11 +23,10 @@ from pca.domain.conversation import Message
 from pca.domain.ids import ConversationId
 from pca.domain.retrieval import ContextPackage, RetrievalQuery, RetrievalResult
 from pca.observability.logging import get_logger
-from pca.ports.graph import GraphHit
 from pca.ports.llm import LLMProviderPort, Prompt, PromptMessage
 from pca.services.context_assembly import ContextAssemblyService
 from pca.services.conversation import ConversationService
-from pca.services.retrieval import DEFAULT_BUDGET, RetrievalService
+from pca.services.retrieval import RetrievalService
 
 _log = get_logger(__name__)
 
@@ -36,6 +35,8 @@ You are a private personal-context assistant. You hold the user's own history.
 
 How to use the context you are given:
 - Material under "Stated by the user" is fact. You may rely on it.
+- Material under "Current state" is true now but replaced an earlier record. If
+  asked about the past, say the record changed rather than implying it always held.
 - Material under "Derived by the system" is your own earlier inference. Attribute
   it as such if you use it; never present it as something the user told you.
 - Material under "Uncertain" must not be asserted. Ask instead.
@@ -57,7 +58,6 @@ class ConversationState(TypedDict, total=False):
     user_message: str
     history: Annotated[Sequence[Message], _keep_last]
     retrieval: Annotated[RetrievalResult, _keep_last]
-    raw_hits: Annotated[Sequence[GraphHit], _keep_last]
     context: Annotated[ContextPackage, _keep_last]
     rendered_context: Annotated[str, _keep_last]
 
@@ -103,28 +103,20 @@ class ConversationWorkflow:
         return {"history": history}
 
     async def _retrieve(self, state: ConversationState) -> ConversationState:
-        query = RetrievalQuery(text=state["user_message"], budget=DEFAULT_BUDGET)
+        # The budget comes from the governor rather than a module constant, so Unit
+        # 5's IntentRouter can vary it per intent without touching this node.
+        query = RetrievalQuery(
+            text=state["user_message"], budget=self._retrieval.budget_for()
+        )
         result = await self._retrieval.retrieve(query)
-
-        # Naive-only: the skeleton has no typed memory yet, so raw graph hits are
-        # carried through to give the model something. Unit 3 replaces this with
-        # committed Facts and Events.
-        try:
-            raw = await self._retrieval.raw_hits(
-                state["user_message"], limit=DEFAULT_BUDGET.max_items
-            )
-        except Exception:  # noqa: BLE001 - degradation already recorded upstream
-            raw = []
-
-        return {"retrieval": result, "raw_hits": raw}
+        return {"retrieval": result}
 
     async def _assemble(self, state: ConversationState) -> ConversationState:
         package = await self._assembly.assemble(
             result=state["retrieval"],
             history=state.get("history", []),
-            raw_hits=state.get("raw_hits", []),
         )
-        rendered = self._assembly.render(package, raw_hits=state.get("raw_hits", []))
+        rendered = self._assembly.render(package)
         return {"context": package, "rendered_context": rendered}
 
     # -------------------------------------------------------------------- public

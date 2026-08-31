@@ -58,6 +58,17 @@ class Fact:
     subject_entity_ids: list[EntityId] = field(default_factory=list)
     temporal_expression: TemporalExpression | None = None
     superseded_by: MemoryId | None = None
+    supersedes: MemoryId | None = None
+    """Set when this fact replaced an earlier world state (Unit 3's `supersede`).
+
+    Read by context assembly to populate `ContextPackage.currently_believed`.
+    Without it that bucket has no meaning distinct from `user_stated`, because a
+    fact that never superseded anything is simply the current belief by default.
+    Knowing a fact REPLACED something is materially different information for the
+    model: "Priya lives in Bangalore, superseding an earlier record" invites a
+    different answer than the bare statement."""
+    corrected_from: MemoryId | None = None
+    """Set when this fact corrected a mistaken earlier record."""
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.salience <= 1.0:
@@ -69,6 +80,11 @@ class Fact:
     def is_active(self) -> bool:
         """Currently believed and not superseded."""
         return self.belief.retracted_at is None and self.superseded_by is None
+
+    @property
+    def has_history(self) -> bool:
+        """Whether this fact replaced or corrected an earlier record."""
+        return self.supersedes is not None or self.corrected_from is not None
 
 
 @dataclass(frozen=True, slots=True)

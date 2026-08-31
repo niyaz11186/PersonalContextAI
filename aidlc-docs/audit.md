@@ -1104,3 +1104,161 @@ activation on the Docker machine. Startup should report
 Not done in this unit, carried forward: user-facing provisional-entity review (Unit 6);
 belief history for events and relationships (schema supports it, only `fact` is
 written); live verification.
+
+## 2026-08-30 - Unit 3 Activation (partial) + Unit 4 Retrieval Depth Code Complete
+
+### Unit 3 activation result
+
+User synced to the Docker machine and restarted. Confirmed working live:
+
+- Migration 0003 applied. `belief_history` and `memory_operations` exist and populate.
+- `memory_operation_recorded operation=commit` on every commit.
+- `belief_history` shows `asserted` rows carrying the fact statements.
+- Commit path atomic against real PostgreSQL — the `scope()` helper's
+  join-vs-open-transaction logic works with asyncpg, which had never been exercised
+  outside fakes.
+- `self_mention_linked` and `entity_linked score=1.0` continue to work across
+  conversations.
+
+**Not verified live**: `supersede` and `correct`. Both facts in the user's test were
+plain `asserted` commits. There is no HTTP endpoint for either operation until Unit 6,
+so the only live trigger is automatic supersession when the conflict classifier
+returns `temporal_change` during a commit. Flagged to the user rather than recorded as
+verified.
+
+### Unit 4: the bug the unit was hiding
+
+`RetrievalResult.facts` **was always empty** — through Units 1b, 2, and 3. Retrieval
+returned only diagnostics; the context the model saw was raw Graphiti edge text passed
+through a `raw_hits` side channel.
+
+The assistant's answers were therefore built from Graphiti's paraphrase rather than
+from the facts committed to PostgreSQL. That inverts ADR-015: the graph became the
+effective source of truth for everything the user was told, while PostgreSQL held
+records nothing read. Invisible because the paraphrase usually resembles the original,
+so answers looked correct.
+
+Fixed: `retrieve()` resolves graph candidates against PostgreSQL and returns typed
+`Fact` objects. `raw_hits` deleted from the service, the workflow, and the assembler.
+
+### Bugs found in existing code
+
+**Entity-scoped search never worked.** `search_by_entity` passed `str(entity_id)` as
+Graphiti's `center_node_uuid`. Our `EntityId` and Graphiti's node uuid come from
+independent extraction passes over the same text and never coincide, so the centre node
+matched nothing and the strategy silently returned UNSCOPED results. Port changed to
+take a name; resolution moved to `RetrievalService` via `EntityRepositoryPort`.
+Recorded as C-30.
+
+**`search_semantic` was not semantic.** Unit 1b called Graphiti's default `search()`,
+which is internally hybrid (cosine + BM25 + BFS). Attributing that to "semantic" made
+per-strategy diagnostics fiction. Each strategy now declares exactly one search method
+via an explicit `SearchConfig`.
+
+**Reranking cost.** Read the installed `GeminiRerankerClient` source: `rank()` issues
+**one API call per passage**. Uncapped, a 60-hit fused set is 60 Gemini calls. Capped
+at 20 (C-31); overflow keeps its fused rank and is appended rather than dropped.
+
+### Regression caught by the existing suite
+
+`degraded` was initially `all(strategies failed)`. With the graph down but one strategy
+returning an empty list without raising, that evaluated False and the system reported
+healthy retrieval over missing memory — the precise failure this product cannot afford.
+Changed to `any(failed)`: each strategy exists to catch what the others miss, so losing
+one genuinely means context may be absent (NFR-06.5). Erring toward disclosure.
+
+### Design decisions
+
+- **RRF over score fusion.** Cosine 0.82 and BM25 11.4 are incomparable scales;
+  summing lets the larger-scaled strategy decide the ranking, and per-strategy
+  normalisation over few results is dominated by outliers. RRF uses rank only, so
+  agreement across independent strategies beats one confident score.
+- **Unweighted RRF.** Weights need tuning data that does not exist yet; untuned weights
+  are just an arbitrary bias. ADR-016's seam exists to fit them later against evidence.
+- **Four buckets by priority, not independent predicates**, so they are disjoint — a
+  fact in two buckets would let the model double-count corroboration. Uncertainty
+  outranks origin; "replaced an earlier record" outranks origin.
+- **`Fact.supersedes` / `Fact.corrected_from` added.** Migration 0003 wrote these
+  columns and nothing read them. Without them `currently_believed` is indistinguishable
+  from `user_stated`.
+- **Graph-to-Postgres matching is normalised statement text and is imperfect.**
+  Graphiti paraphrases, and no shared id exists — it assigns edge ids during its own
+  pass with no knowledge of our commit. Unmatched hits contribute ranking signal only,
+  and the ratio is surfaced in diagnostics so a broken seam is visible. Facts the graph
+  never indexed are still returned, so retrieval is not hostage to its extraction.
+
+### Test-count change
+
+269 → 310. New: `tests/unit/test_retrieval_depth.py` (37),
+`tests/integration/test_retrieval_flow.py` (4). `FakeMemoryGraph` rewritten so
+semantic (any shared word) and full-text (whole phrase) genuinely differ — otherwise a
+test asserting independent strategy contribution would pass against an implementation
+running one strategy twice. Its temporal search models overlap rather than containment
+for the same reason.
+
+### Status
+
+CODE COMPLETE, 310 passing offline. No migration in this unit. Awaiting live
+activation; the latency profile is the main unknown, since five strategies plus a
+capped rerank is materially more model calls than Unit 1b's single fused search.
+
+## 2026-08-30 (cont.) - Pre-Unit-5 Audit: Third Silent-Empty-Result Defect Found and Fixed
+
+User asked for a crucial-gap check before Unit 5. Rather than re-describe Unit 4 from
+memory, re-verified the new Graphiti adapter methods against the installed
+`graphiti_core` source directly, the same way the Unit 1b `uuid` defect was found.
+
+### Finding: `search_temporal` and `traverse` would have silently returned nothing forever
+
+`graphiti_core.search.search.search()` contains, before it inspects `config` at all:
+
+    if query.strip() == '':
+        return SearchResults()
+
+My Unit 4 implementation of `search_temporal` and `traverse` passed `query=""` on the
+reasoning that date-filtering and breadth-first traversal do not need query text —
+correct about those search methods, wrong about the gate in front of them. Confirmed
+`edge_bfs_search` genuinely never reads the query string; the empty-result path is
+entirely Graphiti's own top-level guard, unconditional.
+
+Consequence had this reached the Docker machine: 2 of 5 retrieval strategies dead on
+arrival, no exception, no diagnostic flag — indistinguishable in every test from
+"legitimately found nothing," because `FakeMemoryGraph` had no such gate to violate.
+Same failure shape as the Unit 1b `uuid` defect and the Unit 4 `center_node_uuid`
+defect: correct-looking code, full test suite green, silently inert against the real
+system.
+
+**Fix**: both port methods now take a required `text: str` parameter. The adapter
+raises `ValueError` if it is empty rather than silently degrading. `search_temporal`
+now filters to text relevant to the query within the window — arguably better
+retrieval behaviour than "everything valid during the window" regardless of
+relevance, not merely a workaround.
+
+**Test-guarded**: `FakeMemoryGraph.search_temporal`/`traverse` now enforce the same
+empty-query gate Graphiti does, and
+`tests/unit/test_graphiti_adapter_contract.py` gained four tests asserting the exact
+kwarg passed to Graphiti's `search_()` is never empty — the same pattern as the
+existing `uuid` regression test. 310 → 314.
+
+### Rest of the pre-Unit-5 sweep
+
+- No `NotImplementedError`, `TODO`, or `FIXME` remain except `invalidate_edge` and
+  `entity_divergence` on `GraphitiMemoryAdapter`. Both are dead code today: nothing
+  in `MemoryService.correct`/`supersede`/`retract` calls `invalidate_edge` (the
+  comment claiming "arrives with Unit 3" is stale — Unit 3 landed without wiring it),
+  and `entity_divergence` is unreached until `ReindexService` exists in Unit 7. Not
+  blocking; flagged as stale comments to correct rather than functional gaps.
+- `.env` has `GOOGLE_API_KEY` blank (user hygiene, expected) and
+  `PCA_LLM_MODEL=gemini-3.5-flash` — the user has NOT reverted to `-lite`, so the
+  free-tier workaround is currently off.
+- `/health` already reports per-dependency status and an ingestion backlog; no gap
+  found here for Unit 5 to inherit.
+- Full suite: 314 passed, 0 failed, no lint/type diagnostics on any Unit 4 file.
+
+### Still open, not fixed (by design, carried to Unit 5/6/7 as previously recorded)
+
+- `supersede`/`correct` unverified live (no HTTP endpoint until Unit 6).
+- `retrieval_diagnostics` persistence table is Unit 7's.
+- `invalidate_edge`/`entity_divergence` remain `NotImplementedError` — genuinely
+  unneeded until Units 3(retroactively)/7 wire them, but comments should be corrected
+  to stop claiming a unit that already shipped.

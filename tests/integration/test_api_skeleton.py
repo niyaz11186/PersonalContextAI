@@ -142,8 +142,16 @@ def build_fake_container(
         llm_model="fake-llm",
         embedding_model="fake-embed",
     )
-    retrieval = RetrievalService(graph=graph)
-    assembly = ContextAssemblyService()
+    retrieval = RetrievalService(
+        graph=graph,
+        # Wired with the repositories so integration tests exercise the real
+        # resolution path (ADR-015). Without them retrieval returns no facts and the
+        # assembled context would be empty for reasons unrelated to what is tested.
+        memory=memory_repository,
+        entities=entity_repository,
+        beliefs=belief_repository,
+    )
+    assembly = ContextAssemblyService(provenance=provenance)
 
     container = Container(
         settings=settings,
@@ -192,6 +200,18 @@ def build_fake_container(
     container.test_belief_repo = belief_repository  # type: ignore[attr-defined]
     container.test_operation_repo = operation_repository  # type: ignore[attr-defined]
     container.test_transactions = transactions  # type: ignore[attr-defined]
+
+    # Capture the last RetrievalResult so tests can assert on diagnostics, which are
+    # otherwise consumed inside the workflow and never surface in the HTTP response.
+    container.test_last_retrieval = None  # type: ignore[attr-defined]
+    _real_retrieve = retrieval.retrieve
+
+    async def _recording_retrieve(query):  # type: ignore[no-untyped-def]
+        result = await _real_retrieve(query)
+        container.test_last_retrieval = result  # type: ignore[attr-defined]
+        return result
+
+    retrieval.retrieve = _recording_retrieve  # type: ignore[assignment,method-assign]
     return container
 
 

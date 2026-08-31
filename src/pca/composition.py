@@ -42,7 +42,9 @@ from pca.config.schema_drift import SchemaDriftCheck
 from pca.config.settings import Settings, get_settings
 from pca.observability.logging import configure_logging, get_logger
 from pca.orchestration.conversation_workflow import ConversationWorkflow
+from pca.domain.retrieval import RetrievalBudget
 from pca.services.belief_history import BeliefHistoryService
+from pca.services.budget import DEFAULT_BUDGET, RetrievalBudgetGovernor
 from pca.services.conflicts import ConflictDetectionService
 from pca.services.context_assembly import ContextAssemblyService
 from pca.services.conversation import ConversationService
@@ -169,8 +171,24 @@ def build_container(settings: Settings | None = None) -> Container:
         salience=SalienceScorer(),
         model=settings.llm_model,
     )
-    retrieval = RetrievalService(graph=graph)
-    assembly = ContextAssemblyService()
+    governor = RetrievalBudgetGovernor(
+        RetrievalBudget(
+            max_duration=settings.retrieval_budget,
+            max_items=DEFAULT_BUDGET.max_items,
+            max_context_chars=DEFAULT_BUDGET.max_context_chars,
+        )
+    )
+    retrieval = RetrievalService(
+        graph=graph,
+        # ADR-015: the graph finds candidates, PostgreSQL asserts what is true.
+        # Without these repositories retrieval would return graph paraphrases as
+        # though they were remembered facts.
+        memory=memory_repository,
+        entities=entity_repository,
+        beliefs=belief_repository,
+        governor=governor,
+    )
+    assembly = ContextAssemblyService(provenance=provenance)
 
     workflow = ConversationWorkflow(
         conversations=conversations,

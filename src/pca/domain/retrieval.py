@@ -5,6 +5,7 @@ Layer L0. Standard library only.
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from enum import StrEnum
 
 from pca.domain.conversation import Message, SourceExcerpt
 from pca.domain.ids import EntityId
@@ -33,13 +34,48 @@ class RetrievalQuery:
     entity_scope: list[EntityId] | None = None
 
 
+class RetrievalStrategy(StrEnum):
+    """The five strategies fused by RetrievalService (FR-06.2).
+
+    Named rather than free-text so diagnostics can be aggregated across requests.
+    A typo in a string label would silently split one strategy's statistics into
+    two, which is the kind of defect that makes latency tuning quietly wrong.
+
+    TRAVERSAL is deliberately not run concurrently with the others: it is seeded
+    from the fused result set, and traversing from a bad seed is how irrelevant
+    context floods the package (FR-06.5).
+    """
+
+    SEMANTIC = "semantic"
+    FULLTEXT = "fulltext"
+    ENTITY = "entity"
+    TEMPORAL = "temporal"
+    TRAVERSAL = "traversal"
+
+
 @dataclass(frozen=True, slots=True)
 class StrategySpend:
-    """What one retrieval strategy cost and returned."""
+    """What one retrieval strategy cost and returned.
+
+    `hits` is the count this strategy returned BEFORE fusion and dedup, which is
+    what makes per-strategy contribution measurable. Recording the post-fusion
+    number would attribute the same hit to every strategy that found it.
+    """
 
     strategy: str
     duration: timedelta
     hits: int
+    failed: bool = False
+    """True when the strategy raised. Distinguished from `hits == 0`: finding
+    nothing and being unable to look are different facts about the system."""
+
+
+@dataclass(frozen=True, slots=True)
+class Spend:
+    """What retrieval has consumed so far. Input to the stop condition."""
+
+    elapsed: timedelta
+    chars: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,10 +94,29 @@ class RetrievalDiagnostics:
     dropped_by_budget: int = 0
     degraded: bool = False
     notes: list[str] = field(default_factory=list)
+    stopped_early: bool = False
+    """True when the governor halted retrieval before every strategy was
+    exhausted. Separate from `dropped_by_budget`, which counts trimmed results —
+    stopping early and trimming afterwards are different behaviours and
+    conflating them would hide which one the budget actually triggered."""
+    stop_reason: str | None = None
 
     @property
     def total_duration(self) -> timedelta:
         return sum((s.duration for s in self.spends), timedelta())
+
+    @property
+    def contributing_strategies(self) -> list[str]:
+        """Strategies that returned at least one hit.
+
+        The completion criterion for Unit 4 requires showing which strategies
+        contributed, which is not the same as which ones ran.
+        """
+        return [s.strategy for s in self.spends if s.hits > 0 and not s.failed]
+
+    @property
+    def failed_strategies(self) -> list[str]:
+        return [s.strategy for s in self.spends if s.failed]
 
 
 @dataclass(frozen=True, slots=True)

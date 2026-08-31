@@ -656,6 +656,17 @@ class PostgresMemoryRepository:
                     superseded_by=(
                         MemoryId(row["superseded_by"]) if row["superseded_by"] else None
                     ),
+                    # Hydrated so context assembly can tell a fact that replaced an
+                    # earlier state from one that was simply asserted. Written by
+                    # Unit 3, unread until now.
+                    supersedes=(
+                        MemoryId(row["supersedes"]) if row.get("supersedes") else None
+                    ),
+                    corrected_from=(
+                        MemoryId(row["corrected_from"])
+                        if row.get("corrected_from")
+                        else None
+                    ),
                 )
             )
         return hydrated

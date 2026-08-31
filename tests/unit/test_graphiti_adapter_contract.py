@@ -168,6 +168,85 @@ async def test_ingestion_failure_is_translated_to_a_domain_error() -> None:
         await make_adapter(stub).add_episode(make_episode())
 
 
+async def test_search_temporal_never_passes_an_empty_query_to_graphiti() -> None:
+    """The Unit 4 counterpart to the `uuid` regression above.
+
+    `graphiti_core.search.search.search()` returns an empty `SearchResults()`
+    whenever `query.strip() == ""`, checked before the config is even inspected.
+    An implementation that reasoned "the date filter doesn't need text" and passed
+    `query=""` would pass every offline test — the fake graph has no such gate —
+    and silently return zero results against real Neo4j forever, indistinguishable
+    from an empty graph.
+
+    Caught by reading `graphiti_core`'s installed source directly, not by a failing
+    test, which is the same way the `uuid` defect above was eventually found —
+    except this one is caught here before it ever reached a live system.
+    """
+    stub = StubGraphiti()
+    stub.search_ = _record_search_(stub)  # type: ignore[attr-defined]
+
+    await make_adapter(stub).search_temporal(
+        "Priya", (ANCHOR, ANCHOR), limit=10
+    )
+
+    assert stub.search_calls[0]["query"] == "Priya"
+    assert stub.search_calls[0]["query"].strip() != ""
+
+
+async def test_traverse_never_passes_an_empty_query_to_graphiti() -> None:
+    """Same defect, the other affected strategy.
+
+    `edge_bfs_search` itself never reads the query text — only
+    `bfs_origin_node_uuids` matters to BFS — but Graphiti's `search()` gates on the
+    query string before dispatching to ANY search method, BFS included. The adapter
+    must pass something non-empty purely to get past that gate.
+    """
+    stub = StubGraphiti()
+    stub.search_ = _record_search_(stub)  # type: ignore[attr-defined]
+
+    await make_adapter(stub).traverse("Priya lives in Pune", "node-1", depth=2)
+
+    assert stub.search_calls[0]["query"] == "Priya lives in Pune"
+    assert stub.search_calls[0]["query"].strip() != ""
+
+
+async def test_traverse_rejects_empty_text_rather_than_silently_finding_nothing() -> None:
+    """A caller bug (empty text reaching this method) must be loud, not a silent
+    empty result indistinguishable from an unpopulated graph."""
+    stub = StubGraphiti()
+    stub.search_ = _record_search_(stub)  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="non-empty text"):
+        await make_adapter(stub).traverse("", "node-1", depth=2)
+
+
+async def test_search_temporal_rejects_empty_text() -> None:
+    stub = StubGraphiti()
+    stub.search_ = _record_search_(stub)  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="non-empty text"):
+        await make_adapter(stub).search_temporal("", (ANCHOR, ANCHOR), limit=10)
+
+
+def _record_search_(stub: "StubGraphiti"):  # type: ignore[no-untyped-def]
+    """Attach a recording `search_` to a StubGraphiti instance.
+
+    Separate from `StubGraphiti.search` (Unit 1b's simple stub) because the Unit 4
+    methods call the advanced `search_` API with `config`/`search_filter` kwargs.
+    """
+    stub.search_calls = []  # type: ignore[attr-defined]
+
+    class _Results:
+        edges: list[object] = []
+        nodes: list[object] = []
+
+    async def _search_(**kwargs: Any) -> _Results:
+        stub.search_calls.append(kwargs)  # type: ignore[attr-defined]
+        return _Results()
+
+    return _search_
+
+
 async def test_zero_extraction_is_not_an_error() -> None:
     """A message with no durable content should ingest cleanly with zero entities.
 

@@ -4,8 +4,8 @@
 - **Project Type**: Greenfield
 - **Project Name**: Personal Context AI Assistant
 - **Start Date**: 2026-08-11T12:55:00+05:30
-- **Current Stage**: CONSTRUCTION - Unit 3 code complete (269 tests). Awaiting activation.
-- **Next Stage**: Unit 3 activation on the Docker machine (migration 0003), then Unit 4 (Retrieval Depth)
+- **Current Stage**: CONSTRUCTION - Unit 4 code complete (310 tests). Awaiting activation.
+- **Next Stage**: Unit 4 activation on the Docker machine, then Unit 5 (Orchestration Depth)
 - **Core hypothesis**: PROVEN 2026-08-24. A fact stated in one conversation was
   correctly recalled in a separate conversation without being repeated.
 - **Known quality gap**: recall is partial. See Unit 1b activation notes in audit.md.
@@ -58,13 +58,16 @@ all `gemini-2.5-*` (404, retired for new keys), `text-embedding-004` (nonexisten
       Top risk register entry retired: Graphiti + Gemini + Neo4j compose as documented.
 - [x] Unit 2 — Extraction Depth — **COMPLETE 2026-08-24.** Verified live: facts, salience
       categories, entities, and both time axes populated. 240 tests passing.
-- [~] Unit 3 — Temporal Integrity — CODE COMPLETE, 269 tests passing offline.
-      Completion criterion met in tests: supersession retains both states
-      (`state_at(Feb)` = Pune, `state_at(now)` = Bangalore), and after a correction
-      `believed_at` returns a DIFFERENT answer from `state_at` for the same date.
-      Commit is now atomic — the Unit 2 half-written-episode failure is test-guarded.
-      Migration 0003 not yet applied; awaiting activation.
-- [ ] Unit 4 — Retrieval Depth
+- [x] Unit 3 — Temporal Integrity — **CODE COMPLETE + migration 0003 applied live
+      2026-08-30.** Commit path verified atomic against PostgreSQL; `belief_history`
+      and `memory_operations` populating. Completion criterion met in tests.
+      **Supersede/correct not yet exercised live** — no HTTP endpoint until Unit 6,
+      so the only live trigger is automatic supersession via conflict detection.
+- [~] Unit 4 — Retrieval Depth — CODE COMPLETE, 310 tests passing offline.
+      Five strategies genuinely distinct (each an explicit Graphiti SearchConfig),
+      RRF fusion, seeded traversal, capped cross-encoder rerank, governor with a real
+      stop condition. `RetrievalResult.facts` now populated from PostgreSQL per
+      ADR-015 — it was always empty through Units 1b–3. Awaiting live activation.
 - [ ] Unit 4 — Retrieval Depth
 - [ ] Unit 5 — Orchestration Depth
 - [ ] Unit 6 — Management & Inspection
@@ -130,6 +133,9 @@ These are hard constraints, not preferences. Do not revisit without explicit use
 | C-26 | `correct` and `supersede` are distinct operations on distinct time axes. Correct ends BELIEF; supersede ends WORLD validity. Never conflate. | 2026-08-25 |
 | C-27 | `belief_history` and `memory_operations` are append-only. No update or delete method may be added to their repositories. | 2026-08-25 |
 | C-28 | A memory commit is ONE transaction spanning memory rows, provenance, belief history, and the audit entry. | 2026-08-25 |
+| C-29 | Graph search results are candidates only. Facts returned to the user MUST be resolved from PostgreSQL, never constructed from Graphiti's edge text (ADR-015). | 2026-08-30 |
+| C-30 | Our `EntityId` is NOT Graphiti's node uuid — they come from independent extraction passes. Graph entity scoping is by NAME. | 2026-08-30 |
+| C-31 | Cross-encoder reranking MUST be capped. `GeminiRerankerClient.rank` issues one API call per passage. | 2026-08-30 |
 
 ## Architecture Decisions (all settled)
 

@@ -14,10 +14,15 @@ authoritative. The graph is queried to *find* things; PostgreSQL is queried to
 *assert* what is true. Without that rule the system would hold two temporal models
 that can disagree.
 
-Unit scope: only `add_episode` and semantic search are implemented. The remaining
-strategies raise NotImplementedError with an explicit pointer to Unit 4 rather than
-returning approximate results, because a silently wrong retrieval strategy is
-harder to notice than a missing one.
+All five retrieval strategies are implemented as of Unit 4, each built from an
+explicit `SearchConfig` so their contributions are genuinely distinct and separately
+measurable. Unit 1b mapped a single fused Graphiti call to `search_semantic`; that
+call was internally hybrid, so per-strategy diagnostics were meaningless.
+
+Each strategy uses `rrf` reranking internally rather than `cross_encoder`. We fuse
+across strategies ourselves and cross-encode once at the end (`rerank`); letting
+Graphiti cross-encode per strategy would multiply reranker cost by five and produce
+rankings we immediately discard.
 """
 
 from __future__ import annotations
@@ -55,6 +60,20 @@ from graphiti_core.embedder.gemini import (  # noqa: E402
 from graphiti_core.llm_client.config import LLMConfig  # noqa: E402
 from graphiti_core.llm_client.gemini_client import GeminiClient  # noqa: E402
 from graphiti_core.nodes import EpisodeType  # noqa: E402
+from graphiti_core.search.search_config import (  # noqa: E402
+    EdgeReranker,
+    EdgeSearchConfig,
+    EdgeSearchMethod,
+    NodeReranker,
+    NodeSearchConfig,
+    NodeSearchMethod,
+    SearchConfig,
+)
+from graphiti_core.search.search_filters import (  # noqa: E402
+    ComparisonOperator,
+    DateFilter,
+    SearchFilters,
+)
 from neo4j import AsyncGraphDatabase  # noqa: E402
 
 from pca.adapters.graphiti.entity_types import GRAPHITI_ENTITY_TYPES  # noqa: E402
@@ -71,11 +90,6 @@ from pca.ports.graph import (  # noqa: E402
 _log = get_logger(__name__)
 
 MINIMUM_NEO4J_VERSION = (5, 26)
-
-_UNIT4 = (
-    "not implemented in the walking skeleton; Unit 4 delivers the full hybrid "
-    "retrieval set (semantic, full-text, entity-scoped, temporal, traversal)"
-)
 
 
 class GraphitiMemoryAdapter:
@@ -245,55 +259,241 @@ class GraphitiMemoryAdapter:
     # ------------------------------------------------------------------- search
 
     async def search_semantic(self, text: str, limit: int) -> list[GraphHit]:
-        """Graphiti's fused search.
+        """Embedding similarity only — no keyword matching.
 
-        Note: this single call is already hybrid internally (semantic + BM25 +
-        graph). It is mapped to `search_semantic` for now because the skeleton has
-        one strategy. Unit 4 separates the strategies so their contributions can be
-        measured independently — which is the point of RetrievalDiagnostics.
+        Narrowed from Unit 1b, which called Graphiti's default `search()`. That call
+        was internally hybrid (cosine + BM25 + BFS), so attributing its results to
+        "semantic" made per-strategy diagnostics fiction: full-text and traversal
+        were already folded in and could not be measured or disabled independently.
         """
-        try:
-            edges = await self._graphiti.search(query=text, num_results=limit)
-        except Exception as exc:  # noqa: BLE001
-            raise MemoryGraphUnavailable(f"graph search failed: {exc}") from exc
-        return [self._to_hit(edge) for edge in edges]
+        config = SearchConfig(
+            edge_config=EdgeSearchConfig(
+                search_methods=[EdgeSearchMethod.cosine_similarity],
+                reranker=EdgeReranker.rrf,
+            ),
+            limit=limit,
+        )
+        return await self._search_edges(text, config, "semantic search")
 
-    async def search_by_entity(self, entity_id: EntityId, limit: int) -> list[GraphHit]:
+    async def search_fulltext(self, text: str, limit: int) -> list[GraphHit]:
+        """BM25 only — keyword matching, no embeddings.
+
+        Genuinely distinct from `search_semantic` rather than a second call to the
+        same thing. Exact terms are where embeddings are weakest: a rare surname or
+        a project codename may have almost no semantic neighbourhood, and cosine
+        similarity will happily rank a topically-similar-but-wrong fact above the
+        one containing the literal token. Keyword search is what catches those.
+
+        Uses `rrf` reranking rather than `cross_encoder` because this strategy's
+        output is fused by us afterwards; letting Graphiti spend cross-encoder calls
+        per strategy would multiply the reranking cost by five for a ranking we then
+        discard.
+        """
+        config = SearchConfig(
+            edge_config=EdgeSearchConfig(
+                search_methods=[EdgeSearchMethod.bm25],
+                reranker=EdgeReranker.rrf,
+            ),
+            limit=limit,
+        )
+        return await self._search_edges(text, config, "fulltext search")
+
+    async def search_by_entity(self, entity_name: str, limit: int) -> list[GraphHit]:
+        """Facts about one entity, located by name.
+
+        Two steps, because Graphiti's node ids are not ours (see the port docstring).
+        First find the graph's node for this name, then centre an edge search on it.
+        Returns empty rather than raising when the name is not in the graph — an
+        entity we know about that Graphiti has not extracted is an expected
+        divergence (ADR-015), not a failure.
+        """
+        node_uuid = await self._node_uuid_for(entity_name)
+        if node_uuid is None:
+            _log.info("entity_not_in_graph", name=entity_name)
+            return []
+
+        config = SearchConfig(
+            edge_config=EdgeSearchConfig(
+                search_methods=[
+                    EdgeSearchMethod.bm25,
+                    EdgeSearchMethod.cosine_similarity,
+                ],
+                reranker=EdgeReranker.node_distance,
+            ),
+            limit=limit,
+        )
         try:
-            edges = await self._graphiti.search(
-                query="", center_node_uuid=str(entity_id), num_results=limit
+            results = await self._graphiti.search_(
+                query=entity_name, config=config, center_node_uuid=node_uuid
             )
         except Exception as exc:  # noqa: BLE001
             raise MemoryGraphUnavailable(f"entity search failed: {exc}") from exc
-        return [self._to_hit(edge) for edge in edges]
-
-    async def traverse(
-        self, seed: EntityId, depth: int, edge_types: list[str] | None = None
-    ) -> list[GraphHit]:
-        # Graphiti expresses traversal as centre-node reranked search rather than
-        # explicit depth. Honouring `depth` and `edge_types` properly needs the
-        # search-recipe API, which Unit 4 introduces.
-        return await self.search_by_entity(seed, limit=depth * 5)
-
-    async def search_fulltext(self, text: str, limit: int) -> list[GraphHit]:
-        raise NotImplementedError(f"search_fulltext {_UNIT4}")
+        return [self._to_hit(edge) for edge in results.edges]
 
     async def search_temporal(
-        self, window: tuple[datetime, datetime], limit: int
+        self, text: str, window: tuple[datetime, datetime], limit: int
     ) -> list[GraphHit]:
-        raise NotImplementedError(f"search_temporal {_UNIT4}")
+        """Edges relevant to `text` whose validity overlaps the window.
+
+        **`text` must not be empty.** `graphiti_core.search.search.search()` checks
+        `query.strip() == ""` and returns an empty `SearchResults()` before it even
+        inspects `config` — the date filter below never runs against an empty
+        string. An earlier version of this method took no text argument and passed
+        `""`, which passed every offline test (the fake graph has no such gate) and
+        would have silently returned zero results against real Neo4j forever.
+
+        The filter itself expresses overlap, not containment: an edge valid from
+        January with no end date is still true during March. Filtering on
+        `valid_at` falling inside the window would miss exactly the long-running
+        facts most worth retrieving — where someone lives, who they work for.
+
+        SearchFilters nests as OR-of-AND: the outer list is disjunction, each inner
+        list conjunction.
+        """
+        if not text.strip():
+            raise ValueError(
+                "search_temporal requires non-empty text; Graphiti's search() "
+                "returns nothing for an empty query regardless of filters"
+            )
+        start, end = window
+        config = SearchConfig(
+            edge_config=EdgeSearchConfig(
+                search_methods=[EdgeSearchMethod.bm25, EdgeSearchMethod.cosine_similarity],
+                reranker=EdgeReranker.rrf,
+            ),
+            limit=limit,
+        )
+        filters = SearchFilters(
+            # Began at or before the window ended.
+            valid_at=[
+                [DateFilter(date=end, comparison_operator=ComparisonOperator.less_than_equal)]
+            ],
+            # Ended after the window began, or never ended.
+            invalid_at=[
+                [
+                    DateFilter(
+                        date=start, comparison_operator=ComparisonOperator.greater_than
+                    )
+                ],
+                [DateFilter(comparison_operator=ComparisonOperator.is_null)],
+            ],
+        )
+        try:
+            results = await self._graphiti.search_(
+                query=text, config=config, search_filter=filters
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise MemoryGraphUnavailable(f"temporal search failed: {exc}") from exc
+        return [self._to_hit(edge) for edge in results.edges]
+
+    async def traverse(
+        self, text: str, seed_ref: str, depth: int, edge_types: list[str] | None = None
+    ) -> list[GraphHit]:
+        """Breadth-first expansion from a seed node.
+
+        `depth` maps onto Graphiti's `bfs_max_depth`. This is the one strategy that
+        genuinely follows graph structure rather than matching text, which is what
+        finds the fact nobody asked about directly — "who is Priya's employer" when
+        the question was about Bangalore.
+
+        `text` is required even though `edge_bfs_search` itself never reads it —
+        see the port docstring. Graphiti's `search()` gates on the query string
+        before dispatching to any search method, BFS included.
+        """
+        if not text.strip():
+            raise ValueError(
+                "traverse requires non-empty text; Graphiti's search() returns "
+                "nothing for an empty query regardless of the BFS config"
+            )
+        config = SearchConfig(
+            edge_config=EdgeSearchConfig(
+                search_methods=[EdgeSearchMethod.bfs],
+                reranker=EdgeReranker.rrf,
+                bfs_max_depth=max(1, depth),
+            ),
+            limit=depth * 5,
+        )
+        filters = (
+            SearchFilters(edge_types=edge_types) if edge_types else SearchFilters()
+        )
+        try:
+            results = await self._graphiti.search_(
+                query=text,
+                config=config,
+                bfs_origin_node_uuids=[seed_ref],
+                search_filter=filters,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise MemoryGraphUnavailable(f"traversal failed: {exc}") from exc
+        return [self._to_hit(edge) for edge in results.edges]
 
     async def rerank(self, query: str, hits: list[GraphHit]) -> list[GraphHit]:
-        # Graphiti already applies the cross-encoder inside search(). Reranking
-        # again here would spend a second model call for no gain. Unit 4 reranks
-        # explicitly once strategies are fused by us rather than by Graphiti.
-        return hits
+        """Cross-encode the fused set.
+
+        Now that WE fuse the strategies rather than Graphiti, its internal
+        cross-encoder no longer sees the combined candidate set — it only ever ranked
+        within one strategy. This is the single place the reranker sees everything.
+
+        **Cost warning:** `GeminiRerankerClient.rank` issues one API call per
+        passage. The caller must cap the input (RetrievalBudgetGovernor.rerank_cutoff
+        exists for this). Reranking an uncapped fused set is the fastest way to blow
+        the latency budget.
+
+        Falls back to the input order on failure. A degraded ranking is a far better
+        outcome than a failed request, and the fused order is already reasonable.
+        """
+        if len(hits) <= 1:
+            return hits
+
+        by_content: dict[str, GraphHit] = {}
+        for hit in hits:
+            # Duplicate content would make the returned passage ambiguous when
+            # mapping scores back. Keep the first occurrence.
+            by_content.setdefault(hit.content, hit)
+
+        passages = list(by_content)
+        if len(passages) <= 1:
+            return hits
+
+        try:
+            ranked = await self._graphiti.cross_encoder.rank(query, passages)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning(
+                "rerank_failed",
+                error=str(exc)[:200],
+                consequence="falling back to fused order",
+            )
+            return hits
+
+        ordered: list[GraphHit] = []
+        for passage, score in ranked:
+            hit = by_content.get(passage)
+            if hit is not None:
+                # Carry the cross-encoder score forward; it is more meaningful than
+                # the per-strategy score it replaces.
+                ordered.append(
+                    GraphHit(
+                        ref=hit.ref,
+                        content=hit.content,
+                        score=score,
+                        valid_from=hit.valid_from,
+                        valid_to=hit.valid_to,
+                        entity_ids=hit.entity_ids,
+                        raw=hit.raw,
+                    )
+                )
+        return ordered or hits
 
     # ---------------------------------------------------------- administration
 
     async def invalidate_edge(self, ref: str, at: datetime) -> None:
+        # Not wired even though Unit 3 landed. MemoryService.correct/supersede/
+        # retract operate on PostgreSQL only (ADR-005/015) and never call this —
+        # Graphiti's own temporal invalidation runs independently inside its
+        # extraction pipeline. Left unimplemented until a concrete caller exists
+        # rather than guessing at a signature nothing uses yet.
         raise NotImplementedError(
-            "edge invalidation arrives with the temporal write path in Unit 3"
+            "no caller yet; PostgreSQL corrections do not propagate to graph edges"
         )
 
     async def entity_divergence(self) -> list[EntityDivergence]:
@@ -325,6 +525,53 @@ class GraphitiMemoryAdapter:
             return False
 
     # --------------------------------------------------------------- internals
+
+    async def _search_edges(
+        self, query: str, config: SearchConfig, label: str
+    ) -> list[GraphHit]:
+        try:
+            results = await self._graphiti.search_(query=query, config=config)
+        except Exception as exc:  # noqa: BLE001
+            raise MemoryGraphUnavailable(f"{label} failed: {exc}") from exc
+        return [self._to_hit(edge) for edge in results.edges]
+
+    async def _node_uuid_for(self, name: str) -> str | None:
+        """Find Graphiti's own node id for an entity name.
+
+        Needed because our EntityId is not Graphiti's node uuid. Matches on exact
+        name first and only falls back to the top-ranked node, so a search for
+        "Priya" does not silently centre on "Priyanka" — a wrong centre node returns
+        confidently scoped results about the wrong person, which is worse than
+        returning nothing.
+        """
+        config = SearchConfig(
+            node_config=NodeSearchConfig(
+                search_methods=[NodeSearchMethod.bm25, NodeSearchMethod.cosine_similarity],
+                reranker=NodeReranker.rrf,
+            ),
+            limit=5,
+        )
+        try:
+            results = await self._graphiti.search_(query=name, config=config)
+        except Exception as exc:  # noqa: BLE001
+            raise MemoryGraphUnavailable(f"node lookup failed: {exc}") from exc
+
+        nodes = list(getattr(results, "nodes", None) or [])
+        if not nodes:
+            return None
+
+        wanted = name.strip().casefold()
+        for node in nodes:
+            if str(getattr(node, "name", "")).strip().casefold() == wanted:
+                return str(getattr(node, "uuid", "")) or None
+
+        _log.info(
+            "entity_name_no_exact_graph_match",
+            name=name,
+            candidates=[str(getattr(n, "name", "")) for n in nodes[:3]],
+            action="scoped search skipped rather than centring on a near match",
+        )
+        return None
 
     @staticmethod
     def _to_hit(edge) -> GraphHit:  # type: ignore[no-untyped-def]
