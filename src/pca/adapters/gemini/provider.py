@@ -10,6 +10,15 @@ Gemini covers LLM, embedding, and cross-encoding roles itself.
 NFR-06.1: retry with backoff, then surface a clear failure. There is no fallback
 provider (constraint C-11), so exhausted retries raise and DegradationPolicy
 decides what the user sees.
+
+RESILIENCY-10 (added in Unit 5): every call is bounded twice — by an explicit
+timeout, and by a semaphore capping concurrent calls. `services.md` §Concurrency
+Model specified the semaphore during Inception and it was never built; the omission
+was invisible while every model call sat on the request path and was therefore
+serialised by one user typing. Unit 5's background extraction removes that
+accidental limit, and without a cap a burst of messages can spawn enough concurrent
+calls to exhaust the Gemini rate limit — which then times out every conversation's
+write barrier at once, turning one saturated dependency into a whole-system stall.
 """
 
 from __future__ import annotations
@@ -65,11 +74,21 @@ class GeminiProviderAdapter:
         default_model: str,
         small_model: str | None = None,
         client: genai.Client | None = None,
+        max_concurrency: int = 4,
+        timeout_seconds: float = 120.0,
     ) -> None:
         self._default_model = default_model
         self._small_model = small_model or default_model
         # Injectable for tests; constructed here otherwise.
         self._client = client or genai.Client(api_key=api_key)
+        self._max_concurrency = max_concurrency
+        self._gate = asyncio.Semaphore(max_concurrency)
+        self._timeout = timeout_seconds
+
+    @property
+    def in_flight(self) -> int:
+        """Calls currently holding a slot. Read by tests and /health."""
+        return self._max_concurrency - self._gate._value  # noqa: SLF001
 
     # ------------------------------------------------------------------ public
 
@@ -96,14 +115,26 @@ class GeminiProviderAdapter:
         """
         target = model or self._default_model
         try:
-            stream = await self._client.aio.models.generate_content_stream(
-                model=target,
-                contents=self._contents(prompt),
-                config=self._config(prompt),
-            )
-            async for chunk in stream:
-                if chunk.text:
-                    yield chunk.text
+            async with self._gate:
+                # The timeout covers establishing the stream, not consuming it. A
+                # long stream is legitimate; one that never produces a first chunk
+                # is the unbounded wait RESILIENCY-10 forbids.
+                stream = await asyncio.wait_for(
+                    self._client.aio.models.generate_content_stream(
+                        model=target,
+                        contents=self._contents(prompt),
+                        config=self._config(prompt),
+                    ),
+                    timeout=self._timeout,
+                )
+                async for chunk in stream:
+                    if chunk.text:
+                        yield chunk.text
+        except TimeoutError as exc:
+            _log.error("gemini_stream_timeout", model=target, seconds=self._timeout)
+            raise ProviderUnavailable(
+                f"Gemini stream did not start within {self._timeout}s"
+            ) from exc
         except Exception as exc:  # noqa: BLE001 - translated to a domain error
             _log.error("gemini_stream_failed", model=target, error=str(exc))
             raise ProviderUnavailable(f"Gemini stream failed: {exc}") from exc
@@ -189,20 +220,38 @@ class GeminiProviderAdapter:
             ),
         )
 
-    @staticmethod
-    async def _with_retry(call, model: str, operation: str):  # type: ignore[no-untyped-def]
+    async def _with_retry(self, call, model: str, operation: str):  # type: ignore[no-untyped-def]
         last: Exception | None = None
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             try:
-                return await call()
+                # Slot acquired per attempt and released before the backoff sleep.
+                # Holding it across an 8 s sleep would starve other callers of a
+                # bulkhead that exists precisely to keep one stalled dependency from
+                # consuming the whole budget.
+                async with self._gate:
+                    return await asyncio.wait_for(call(), timeout=self._timeout)
+            except TimeoutError:  # noqa: PERF203 - retry loop
+                # Retryable: a timeout is the transient case by definition. Without
+                # this branch an explicit timeout would be strictly worse than none,
+                # failing calls that the existing backoff would have recovered.
+                last = ProviderUnavailable(
+                    f"Gemini {operation} exceeded {self._timeout}s"
+                )
+                _log.warning(
+                    "gemini_timeout",
+                    operation=operation,
+                    model=model,
+                    attempt=attempt,
+                    seconds=self._timeout,
+                )
+                if attempt == _MAX_ATTEMPTS:
+                    break
+                await asyncio.sleep(self._backoff(attempt))
             except Exception as exc:  # noqa: BLE001 - classified below
                 last = exc
                 if not _is_retryable(exc) or attempt == _MAX_ATTEMPTS:
                     break
-                # Exponential backoff with jitter, so concurrent retrieval
-                # strategies do not resynchronise onto the same retry instant.
-                delay = min(_BASE_DELAY_SECONDS * 2 ** (attempt - 1), _MAX_DELAY_SECONDS)
-                delay += random.uniform(0, delay * 0.25)  # noqa: S311 - not cryptographic
+                delay = self._backoff(attempt)
                 _log.warning(
                     "gemini_retry",
                     operation=operation,
@@ -215,3 +264,9 @@ class GeminiProviderAdapter:
 
         _log.error("gemini_failed", operation=operation, model=model, error=str(last)[:300])
         raise ProviderUnavailable(f"Gemini {operation} failed after {_MAX_ATTEMPTS} attempts: {last}")
+
+    @staticmethod
+    def _backoff(attempt: int) -> float:
+        """Exponential with jitter, so concurrent callers do not resynchronise."""
+        delay = min(_BASE_DELAY_SECONDS * 2 ** (attempt - 1), _MAX_DELAY_SECONDS)
+        return delay + random.uniform(0, delay * 0.25)  # noqa: S311 - not cryptographic

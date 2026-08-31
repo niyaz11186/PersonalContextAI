@@ -111,12 +111,15 @@ def build_container(settings: Settings | None = None) -> Container:
         small_model=settings.llm_small_model,
         embedding_model=settings.embedding_model,
         reranker_model=settings.reranker_model,
+        timeout_seconds=settings.graph_timeout_seconds,
     )
 
     provider = GeminiProviderAdapter(
         api_key=settings.google_api_key,
         default_model=settings.llm_model,
         small_model=settings.llm_small_model,
+        max_concurrency=settings.max_concurrent_llm_calls,
+        timeout_seconds=settings.llm_timeout_seconds,
     )
 
     conversation_repository = PostgresConversationRepository(store)

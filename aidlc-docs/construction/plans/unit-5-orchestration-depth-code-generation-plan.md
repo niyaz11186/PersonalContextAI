@@ -340,27 +340,30 @@ langgraph import; `PostgresCheckpointSaver` in `orchestration/` carries no sqlal
       thing in the unit and everything after this depends on it holding
 
 ### Step 6 — `ExtractionCoordinator` (L3)
-- [ ] `src/pca/services/extraction_coordinator.py`
-- [ ] `submit(episode_id, conversation_id)` — durable status row written **before** the task is
+- [x] `src/pca/services/extraction_coordinator.py`
+- [x] `submit(episode_id, conversation_id)` — durable status row written **before** the task is
       spawned. Reversing that order is how a crash between the two loses the episode with no
       record it was ever queued
-- [ ] `await_barrier(conversation_id, timeout)` → `BarrierResult`, per D-1 and D-5
-- [ ] `recover_pending()` — re-queue rows left `running` by a crash
-- [ ] In-process `asyncio.Lock` per conversation as an optimisation over the durable row, never
-      as a substitute for it (ADR-008)
-- [ ] `drain(timeout)` for graceful shutdown; `quiesce()`/`resume()` pair that Unit 7's backup
+- [x] `await_barrier(conversation_id, timeout)` → `BarrierResult`, per D-1 and D-5
+- [x] `recover_pending()` — re-queue rows left `running` by a crash
+- [x] In-process `asyncio.Lock` per conversation as an optimisation over the durable row, never
+      as a substitute for it (ADR-008). **Implemented as a per-conversation task set rather than
+      a lock**: the barrier's question is "has this conversation's work finished", which
+      `asyncio.wait` over the owning tasks answers directly, whereas a lock would have needed a
+      parallel structure to track what it was guarding
+- [x] `drain(timeout)` for graceful shutdown; `quiesce()`/`resume()` pair that Unit 7's backup
       will call
-- [ ] Idempotency: `claim` is a conditional UPDATE on `episode_id`, so a duplicate submit is a
+- [x] Idempotency: `claim` is a conditional insert on `episode_id`, so a duplicate submit is a
       no-op at the database rather than a race in the process
-- [ ] **Bounded task pool** (RESILIENCY-10 bulkhead, added by the resiliency review): a
-      `max_concurrent_extractions` semaphore. Unbounded `create_task` lets a burst of messages
-      spawn arbitrarily many concurrent Gemini calls, exhausting the rate limit and pushing every
-      conversation's barrier into timeout at once — one slow dependency taking down the whole
-      write path, which is exactly what the bulkhead rule exists to prevent
-- [ ] **Per-extraction wall-clock timeout** distinct from the barrier timeout. The barrier timeout
-      unblocks the *reader*; without a task-side timeout the extraction itself runs on forever,
-      holding a pool slot and a durable `running` row that `recover_pending` cannot reclaim
-      because the process still owns it
+- [x] **Bounded task pool** (RESILIENCY-10 bulkhead)
+- [x] **Per-extraction wall-clock timeout** distinct from the barrier timeout
+- [x] Strong references held for spawned tasks. asyncio keeps only a weak reference to a running
+      task, so one not stored anywhere can be collected mid-flight — extraction would simply stop,
+      leaving a `running` row nobody retries until restart
+- [x] `ABANDONED` kept distinct from `FAILED`, and included in `recoverable()`. Collapsing them
+      would either retry genuine failures forever or discard work that was merely slow
+- [x] `tests/fakes/extraction_status.py` and `tests/unit/test_extraction_coordinator.py`
+      (14 tests), pulled forward from Step 15
 
 ### Step 6b — Provider bulkhead and explicit timeouts (RESILIENCY-10, RESILIENCY-09)
 
@@ -371,17 +374,26 @@ was.** Unit 5 is the point at which that matters, because until now every model 
 request path and therefore naturally serialised by one user typing. Background extraction removes
 that accidental limit.
 
-- [ ] `asyncio.Semaphore` in `GeminiProviderAdapter` bounding concurrent calls, size from settings
-- [ ] Explicit timeout on every Gemini call. `_with_retry` currently retries on a timeout marker
-      in the exception text but never imposes one, so a hung call waits on the SDK's default
+- [x] `asyncio.Semaphore` in `GeminiProviderAdapter` bounding concurrent calls, size from settings
+- [x] Explicit timeout on every Gemini call. `_with_retry` previously retried on a timeout marker
+      in the exception text but never imposed one, so a hung call waited on the SDK's default
       forever — an unbounded wait, which RESILIENCY-10 forbids outright
-- [ ] Explicit timeout on `GraphitiMemoryAdapter` calls (`add_episode`, the five searches,
-      `rerank`). Same gap: no timeout anywhere in that adapter today
-- [ ] New settings: `PCA_MAX_CONCURRENT_EXTRACTIONS`, `PCA_LLM_TIMEOUT_SECONDS`,
-      `PCA_GRAPH_TIMEOUT_SECONDS`
+- [x] Timeout counts as retryable. Without that branch an explicit timeout would be strictly
+      *worse* than none, failing calls the existing backoff would have recovered
+- [x] Semaphore acquired per attempt and released before the backoff sleep. Holding a slot across
+      an 8 s sleep would starve the bulkhead it exists to protect
+- [x] `stream()` bounds establishing the stream, not consuming it. A long stream is legitimate;
+      one that never yields a first chunk is the unbounded wait
+- [x] Explicit timeout on `GraphitiMemoryAdapter` — `_guard()` applied to all seven call sites
+      (`add_episode`, five searches, `rerank`, node lookup). The adapter previously had no
+      timeout of any kind
+- [x] Timeouts translate to `MemoryGraphUnavailable`, which callers already degrade on (ADR-005)
+- [x] New settings: `PCA_MAX_CONCURRENT_LLM_CALLS`, `PCA_MAX_CONCURRENT_EXTRACTIONS`,
+      `PCA_LLM_TIMEOUT_SECONDS`, `PCA_GRAPH_TIMEOUT_SECONDS`, `PCA_EXTRACTION_TIMEOUT_SECONDS`
+- [x] Wired into `composition.py` immediately rather than deferred to Step 13 — an unwired
+      setting is exactly the "specified but never built" failure this step exists to fix
 - [ ] Document the Gemini free-tier request/minute limits in `SETUP.md` and the per-turn call
-      budget that Unit 5 implies (RESILIENCY-09 service quota awareness). The project has already
-      hit this ceiling once — it drove the `-lite` model workaround recorded in audit.md
+      budget that Unit 5 implies (RESILIENCY-09 service quota awareness)
 
 ### Step 7 — `IntentRouter` (L2)
 - [ ] `src/pca/orchestration/intent_router.py`

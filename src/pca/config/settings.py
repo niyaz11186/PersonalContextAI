@@ -66,6 +66,30 @@ class Settings(BaseSettings):
         default=False, alias="PCA_PERSIST_RETRIEVAL_DIAGNOSTICS"
     )
 
+    # --- Bounds (RESILIENCY-10: no unbounded waits, no unbounded concurrency) ---
+    #
+    # These exist because Unit 5 moves extraction off the request path. Until then
+    # every model call was serialised by one user typing, which hid the absence of
+    # any limit. `services.md` §Concurrency Model specified the provider semaphore in
+    # Inception; it was never built.
+    max_concurrent_llm_calls: int = Field(
+        default=4, alias="PCA_MAX_CONCURRENT_LLM_CALLS"
+    )
+    max_concurrent_extractions: int = Field(
+        default=2, alias="PCA_MAX_CONCURRENT_EXTRACTIONS"
+    )
+    # Generous, because structured extraction on the large model measured ~3 s and a
+    # cold call can be far slower. The point is a ceiling, not a tight bound.
+    llm_timeout_seconds: int = Field(default=120, alias="PCA_LLM_TIMEOUT_SECONDS")
+    graph_timeout_seconds: int = Field(default=120, alias="PCA_GRAPH_TIMEOUT_SECONDS")
+    # Wall clock for one background extraction, distinct from the barrier timeout.
+    # The barrier timeout unblocks the reader; without this the extraction itself
+    # runs forever, holding a pool slot and a durable `running` row that
+    # recover_pending cannot reclaim because this process still owns it.
+    extraction_timeout_seconds: int = Field(
+        default=300, alias="PCA_EXTRACTION_TIMEOUT_SECONDS"
+    )
+
     @field_validator("user_timezone")
     @classmethod
     def _validate_timezone(cls, value: str) -> str:
@@ -89,6 +113,10 @@ class Settings(BaseSettings):
     @property
     def extraction_barrier_timeout(self) -> timedelta:
         return timedelta(seconds=self.extraction_barrier_timeout_seconds)
+
+    @property
+    def extraction_timeout(self) -> timedelta:
+        return timedelta(seconds=self.extraction_timeout_seconds)
 
     def require_runtime_secrets(self) -> None:
         """Assert everything needed to actually run is present.

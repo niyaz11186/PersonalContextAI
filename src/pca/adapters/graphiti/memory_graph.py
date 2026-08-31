@@ -27,6 +27,7 @@ rankings we immediately discard.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime
 
@@ -108,10 +109,15 @@ class GraphitiMemoryAdapter:
         embedding_dim: int = 3072,
         graphiti: object | None = None,
         driver: object | None = None,
+        timeout_seconds: float = 120.0,
     ) -> None:
         self._uri = uri
         self._user = user
         self._password = password
+        # RESILIENCY-10. Before Unit 5 this adapter had no timeout of any kind, so a
+        # hung Neo4j or Gemini call inside Graphiti waited forever. The retrieval
+        # budget governor masked it on the read path; nothing masked the write path.
+        self._timeout = timeout_seconds
 
         # `graphiti` and `driver` are injectable purely for testing. The uuid defect
         # that silently disabled the whole memory pipeline was undetectable without
@@ -219,18 +225,25 @@ class GraphitiMemoryAdapter:
         history. Graphiti assigns its own node id, returned as `episode_ref`.
         """
         try:
-            results = await self._graphiti.add_episode(
-                name=f"episode-{episode.id}",
-                episode_body=episode.content,
-                source_description=(
-                    "conversation message" if episode.message_id else "imported document"
+            results = await self._guard(
+                self._graphiti.add_episode(
+                    name=f"episode-{episode.id}",
+                    episode_body=episode.content,
+                    source_description=(
+                        "conversation message"
+                        if episode.message_id
+                        else "imported document"
+                    ),
+                    reference_time=episode.occurred_at,
+                    source=(
+                        EpisodeType.message if episode.message_id else EpisodeType.text
+                    ),
+                    # ADR-015: prescribe the ontology rather than letting Graphiti
+                    # infer categories freely, so its graph stays legible against our
+                    # own EntityType and divergence stays small.
+                    entity_types=GRAPHITI_ENTITY_TYPES,
                 ),
-                reference_time=episode.occurred_at,
-                source=EpisodeType.message if episode.message_id else EpisodeType.text,
-                # ADR-015: prescribe the ontology rather than letting Graphiti infer
-                # categories freely, so its graph stays legible against our own
-                # EntityType and divergence stays small.
-                entity_types=GRAPHITI_ENTITY_TYPES,
+                "episode ingestion",
             )
         except Exception as exc:  # noqa: BLE001
             raise MemoryGraphUnavailable(f"episode ingestion failed: {exc}") from exc
@@ -323,8 +336,11 @@ class GraphitiMemoryAdapter:
             limit=limit,
         )
         try:
-            results = await self._graphiti.search_(
-                query=entity_name, config=config, center_node_uuid=node_uuid
+            results = await self._guard(
+                self._graphiti.search_(
+                    query=entity_name, config=config, center_node_uuid=node_uuid
+                ),
+                "entity search",
             )
         except Exception as exc:  # noqa: BLE001
             raise MemoryGraphUnavailable(f"entity search failed: {exc}") from exc
@@ -379,8 +395,11 @@ class GraphitiMemoryAdapter:
             ],
         )
         try:
-            results = await self._graphiti.search_(
-                query=text, config=config, search_filter=filters
+            results = await self._guard(
+                self._graphiti.search_(
+                    query=text, config=config, search_filter=filters
+                ),
+                "temporal search",
             )
         except Exception as exc:  # noqa: BLE001
             raise MemoryGraphUnavailable(f"temporal search failed: {exc}") from exc
@@ -417,11 +436,14 @@ class GraphitiMemoryAdapter:
             SearchFilters(edge_types=edge_types) if edge_types else SearchFilters()
         )
         try:
-            results = await self._graphiti.search_(
-                query=text,
-                config=config,
-                bfs_origin_node_uuids=[seed_ref],
-                search_filter=filters,
+            results = await self._guard(
+                self._graphiti.search_(
+                    query=text,
+                    config=config,
+                    bfs_origin_node_uuids=[seed_ref],
+                    search_filter=filters,
+                ),
+                "traversal",
             )
         except Exception as exc:  # noqa: BLE001
             raise MemoryGraphUnavailable(f"traversal failed: {exc}") from exc
@@ -456,7 +478,9 @@ class GraphitiMemoryAdapter:
             return hits
 
         try:
-            ranked = await self._graphiti.cross_encoder.rank(query, passages)
+            ranked = await self._guard(
+                self._graphiti.cross_encoder.rank(query, passages), "rerank"
+            )
         except Exception as exc:  # noqa: BLE001
             _log.warning(
                 "rerank_failed",
@@ -530,10 +554,29 @@ class GraphitiMemoryAdapter:
         self, query: str, config: SearchConfig, label: str
     ) -> list[GraphHit]:
         try:
-            results = await self._graphiti.search_(query=query, config=config)
+            results = await self._guard(
+                self._graphiti.search_(query=query, config=config), label
+            )
         except Exception as exc:  # noqa: BLE001
             raise MemoryGraphUnavailable(f"{label} failed: {exc}") from exc
         return [self._to_hit(edge) for edge in results.edges]
+
+    async def _guard(self, awaitable, label: str):  # type: ignore[no-untyped-def]
+        """Bound a Graphiti call in time.
+
+        Translated to `MemoryGraphUnavailable` rather than surfacing a raw timeout,
+        because the graph IS degradable (ADR-005) — it is a rebuildable projection
+        and PostgreSQL still holds every fact. Callers already handle this error by
+        narrowing retrieval and disclosing, which is the correct response to a
+        timeout as much as to a refused connection.
+        """
+        try:
+            return await asyncio.wait_for(awaitable, timeout=self._timeout)
+        except TimeoutError as exc:
+            _log.error("graph_timeout", operation=label, seconds=self._timeout)
+            raise MemoryGraphUnavailable(
+                f"{label} exceeded {self._timeout}s"
+            ) from exc
 
     async def _node_uuid_for(self, name: str) -> str | None:
         """Find Graphiti's own node id for an entity name.
@@ -552,7 +595,9 @@ class GraphitiMemoryAdapter:
             limit=5,
         )
         try:
-            results = await self._graphiti.search_(query=name, config=config)
+            results = await self._guard(
+                self._graphiti.search_(query=name, config=config), "node lookup"
+            )
         except Exception as exc:  # noqa: BLE001
             raise MemoryGraphUnavailable(f"node lookup failed: {exc}") from exc
 
