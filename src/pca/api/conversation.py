@@ -109,9 +109,19 @@ async def send_message(
     Step 1 first means that if Gemini is unreachable the user's words are still
     recorded. Step 3 last means extraction never blocks the reply.
 
-    Extraction runs **synchronously after** the stream in this unit, which knowingly
-    violates NFR-02.3. Unit 5's ExtractionCoordinator introduces the durable
-    per-conversation barrier that retires the exception (ADR-008).
+    As of Unit 5 extraction is **off the request path** (ADR-008), which retires the
+    NFR-02.3 exception carried since Unit 1b. The full ordering is now:
+
+        1. persist the user message      <- durability point, before any model call
+        2. await the conversation's write barrier
+        3. classify intent, then stream the reply
+        4. record the episode and hand it to the coordinator, which extracts in
+           the background
+
+    Step 2 is what keeps the core hypothesis true without making the user wait: the
+    previous message's extraction must be visible before this one is answered, but
+    *this* message's extraction is not waited on. On timeout the barrier proceeds with
+    a disclosure rather than blocking indefinitely.
     """
     container = _container(request)
     correlation = new_correlation_id()
@@ -129,6 +139,27 @@ async def send_message(
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
 
     async def event_stream() -> AsyncIterator[str]:
+        notices: list[str] = []
+
+        # The ADR-008 barrier. Waits for the PREVIOUS message's extraction in this
+        # conversation so that a fact just stated is retrievable now — the core
+        # product hypothesis — without waiting for the current message's own
+        # extraction, which is what NFR-02.3 forbids.
+        barrier = await container.coordinator.await_barrier(conversation)
+        if barrier.timed_out and barrier.degradation is not None:
+            # Proceed rather than block forever. The abandoned extraction stays
+            # durable and `recover_pending` retries it, but the reply about to be
+            # generated may not include the last thing the user said.
+            notices.append(barrier.degradation.disclosure)
+
+        # Findings from the PREVIOUS turn's extraction, which finished after that
+        # reply had been sent. Contradictions (FR-05.6) and entity ambiguity
+        # (ADR-014) must be surfaced, and the barrier above has just guaranteed the
+        # extraction that found them is complete — so this is the first moment they
+        # can be reported. One turn late is the cost of ADR-008; dropping them would
+        # be a requirement traded away for latency.
+        notices.extend(container.coordinator.take_notices(conversation))
+
         reply: list[str] = []
         try:
             async for token in container.conversation_workflow.run(
@@ -148,74 +179,42 @@ async def send_message(
                 conversation, Role.ASSISTANT, text
             )
 
-        # Episode recording and extraction happen after the reply so they never
-        # delay the visible response.
+        # Persist the episode, then hand it to the coordinator and return. The
+        # extraction itself — extract, detect conflicts, commit, supersede — now runs
+        # in ExtractionWorkflow off the request path, so none of it extends this
+        # response. That is the NFR-02.3 exception finally retired.
         #
-        # They still run before the terminal `done` event, which means a slow
-        # extraction extends the request. That is the knowing NFR-02.3 exception
-        # carried since Unit 1b: ADR-008's ExtractionCoordinator in Unit 5 moves
-        # this off the request entirely behind a durable per-conversation barrier.
-        notices: list[str] = []
+        # Conflict and clarification notices consequently cannot be reported on THIS
+        # turn: they are discovered after the reply has been sent. They surface on the
+        # next turn instead, which is the honest consequence of moving extraction into
+        # the background rather than a regression. Unit 6's inspection API is where
+        # they become directly visible.
         try:
-            episode = await container.episodes.record_and_ingest(user_message)
-            candidates = await container.extraction.extract(episode)
-
-            # Between extraction and commit — the only position where detection is
-            # useful. Running it after the write would mean the graph already held
-            # both versions with no record that they disagree (FR-05).
-            conflicts = await container.conflicts.detect(candidates)
-
-            receipt = await container.memory.commit(candidates, episode)
-
-            # A temporal change ends an existing fact's world validity rather than
-            # contradicting it: "she moved in March" does not make "she lives in Pune"
-            # false, it bounds it. Superseding keeps the earlier state queryable
-            # (FR-04.4).
-            for change in container.conflicts.supersessions(conflicts):
-                try:
-                    await container.memory.supersede(
-                        change.existing_memory_id,
-                        new_statement=change.incoming_statement,
-                        effective_from=episode.occurred_at,
-                        reason=change.explanation,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    # The new fact is already committed; a failed supersession leaves
-                    # the old one unbounded rather than losing anything.
-                    _log.warning(
-                        "supersession_failed",
-                        memory_id=str(change.existing_memory_id),
-                        error=str(exc)[:200],
-                        consequence="both states retained; old fact not bounded",
-                    )
-
-            contradictions = container.conflicts.contradictions(conflicts)
-            if contradictions:
-                # FR-05.6: surface, never resolve. The system holds two incompatible
-                # beliefs and must say so rather than quietly picking one.
-                notices.append(
-                    "Some of what you said conflicts with what I had recorded: "
-                    + "; ".join(c.explanation for c in contradictions[:3])
-                    + ". Both versions were kept."
-                )
-
-            if receipt.needs_clarification:
-                # ADR-014: an ambiguous entity means this memory may be attached to
-                # the wrong person until someone decides. Surfaced rather than
-                # buried in a log, because silent ambiguity is how a graph quietly
-                # becomes wrong.
-                notices.append(
-                    "One or more people mentioned could not be identified "
-                    "unambiguously. The details were saved separately pending review."
-                )
+            episode = await container.episodes.record_message(user_message)
+            queued = await container.coordinator.submit(episode.id, conversation)
+            if not queued:
+                # Already claimed — a retried request for the same episode. Idempotent
+                # by the `episode_id` primary key (C-35), so this is a no-op, not a
+                # failure.
+                _log.info("extraction_already_claimed", episode_id=str(episode.id))
+        except SourceOfRecordUnavailable as exc:
+            # The message itself is already durable; only the episode row failed.
+            _log.error(
+                "episode_persist_failed",
+                error=str(exc)[:300],
+                consequence="message saved; not queued for extraction",
+            )
+            notices.append(
+                container.degradation.on_memory_write_failure(exc).disclosure
+            )
         except Exception as exc:  # noqa: BLE001 - the message is already durable
             _log.error(
-                "post_reply_memory_write_failed",
+                "extraction_submit_failed",
                 error=str(exc)[:300],
                 consequence="message saved; memory not searchable until recovery",
             )
             notices.append(
-                "Your message was saved, but it could not be added to memory just now."
+                container.degradation.on_memory_write_failure(exc).disclosure
             )
 
         # Deliberately not named `payload`: assigning that name anywhere in this

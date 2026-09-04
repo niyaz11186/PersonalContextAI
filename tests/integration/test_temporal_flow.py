@@ -61,7 +61,19 @@ def client_with(provider: FakeLLMProvider):
 
 
 def send(client: TestClient, text: str):
-    conversation_id = client.post("/conversations", json={}).json()["id"]
+    """Send in a FRESH conversation.
+
+    Use `send_to` when the test depends on anything carried between turns — notably
+    the deferred notices, which are keyed by conversation.
+    """
+    return send_to(client, new_conversation(client), text)
+
+
+def new_conversation(client: TestClient) -> str:
+    return client.post("/conversations", json={}).json()["id"]
+
+
+def send_to(client: TestClient, conversation_id: str, text: str):
     return client.post(
         f"/conversations/{conversation_id}/messages", json={"content": text}
     )
@@ -109,7 +121,15 @@ def test_a_temporal_change_supersedes_and_keeps_both_states() -> None:
 
 
 def test_a_contradiction_is_surfaced_to_the_user() -> None:
-    """FR-05.6 through the API: both versions kept, the user told."""
+    """FR-05.6 through the API: both versions kept, the user told.
+
+    Since Unit 5 the notice arrives one turn after the contradiction is detected.
+    Extraction runs off the response path (ADR-008), so the conflicting fact is
+    classified after that turn's reply has already been sent; the barrier then
+    guarantees the extraction is complete before the following message is handled,
+    which is the first point the finding can be reported. Late, not dropped —
+    FR-05.6 requires it be surfaced, so the coordinator holds it for delivery.
+    """
     provider = FakeLLMProvider(
         completions=["noted"],
         structured_results=[
@@ -120,11 +140,24 @@ def test_a_contradiction_is_surfaced_to_the_user() -> None:
                 explanation="she cannot hold both roles at once",
                 effective_from_phrase="",
             ),
+            # Turn 3 exists only to collect the notice. Its own extraction still runs,
+            # and conflict detection compares its candidate against BOTH stored facts —
+            # so two more classifications are consumed. Scripted as agreement so this
+            # turn contributes no further findings of its own.
+            payload("something else entirely", "Priya", category="identity"),
+            _Classification(kind="agreement", explanation="unrelated"),
+            _Classification(kind="agreement", explanation="unrelated"),
         ],
     )
     with client_with(provider) as (client, container):
-        send(client, "Priya works at Google")
-        response = send(client, "Priya works at Microsoft")
+        # One conversation for all three turns. Deferred notices are keyed by
+        # conversation, so sending each message to a fresh one would file the finding
+        # against a conversation that never asks for it.
+        conversation_id = new_conversation(client)
+        send_to(client, conversation_id, "Priya works at Google")
+        send_to(client, conversation_id, "Priya works at Microsoft")
+        # The turn on which the contradiction found above becomes reportable.
+        response = send_to(client, conversation_id, "Anything else?")
 
         notices = notices_from(response)
         assert any("conflicts with" in n for n in notices), (

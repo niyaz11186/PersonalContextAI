@@ -43,9 +43,21 @@ from pca.config.settings import Settings, get_settings
 from pca.observability.logging import configure_logging, get_logger
 from pca.orchestration.conversation_workflow import ConversationWorkflow
 from pca.domain.retrieval import RetrievalBudget
+from pca.adapters.postgres.checkpoint_repository import PostgresCheckpointStore
+from pca.adapters.postgres.extraction_status_repository import (
+    PostgresExtractionStatusRepository,
+)
+from pca.orchestration.checkpointer import PostgresCheckpointSaver
+from pca.orchestration.clarification_workflow import ClarificationWorkflow
+from pca.orchestration.correction_workflow import CorrectionWorkflow
+from pca.orchestration.extraction_workflow import ExtractionWorkflow
+from pca.orchestration.historical_workflow import HistoricalAnalysisWorkflow
+from pca.orchestration.intent_router import IntentRouter
 from pca.services.belief_history import BeliefHistoryService
 from pca.services.budget import DEFAULT_BUDGET, RetrievalBudgetGovernor
 from pca.services.conflicts import ConflictDetectionService
+from pca.services.degradation import DegradationPolicy
+from pca.services.extraction_coordinator import ExtractionCoordinator
 from pca.services.context_assembly import ContextAssemblyService
 from pca.services.conversation import ConversationService
 from pca.services.entities import EntityService
@@ -86,6 +98,15 @@ class Container:
     operations: MemoryOperationLog
     timeline: TimelineService
     conflicts: ConflictDetectionService
+    # --- Unit 5: orchestration depth ---
+    degradation: DegradationPolicy
+    coordinator: ExtractionCoordinator
+    checkpointer: PostgresCheckpointSaver
+    router: IntentRouter
+    extraction_workflow: ExtractionWorkflow
+    correction_workflow: CorrectionWorkflow
+    clarification_workflow: ClarificationWorkflow
+    historical_workflow: HistoricalAnalysisWorkflow
 
 
 def build_container(settings: Settings | None = None) -> Container:
@@ -193,11 +214,62 @@ def build_container(settings: Settings | None = None) -> Container:
     )
     assembly = ContextAssemblyService(provenance=provenance)
 
+    # ------------------------------------------------------ Unit 5 orchestration
+
+    degradation = DegradationPolicy()
+    checkpointer = PostgresCheckpointSaver(PostgresCheckpointStore(store))
+    router = IntentRouter(provider=provider, model=settings.llm_small_model)
+
+    extraction_workflow = ExtractionWorkflow(
+        episodes=episodes,
+        episode_repository=episode_repository,
+        extraction=extraction,
+        conflicts=conflicts,
+        memory=memory,
+        provenance=provenance,
+    )
+    # The coordinator owns scheduling; the workflow owns the work. `run` matches
+    # ExtractionRunner, so no adapter is needed between them.
+    coordinator = ExtractionCoordinator(
+        repository=PostgresExtractionStatusRepository(store),
+        clock=clock,
+        runner=extraction_workflow.run,
+        degradation=degradation,
+        barrier_timeout=settings.extraction_barrier_timeout,
+        extraction_timeout=settings.extraction_timeout,
+        max_concurrent=settings.max_concurrent_extractions,
+    )
+
+    correction_workflow = CorrectionWorkflow(
+        retrieval=retrieval,
+        memory=memory,
+        memory_repository=memory_repository,
+        provider=provider,
+        clock=clock,
+        checkpointer=checkpointer,
+        model=settings.llm_model,
+    )
+    clarification_workflow = ClarificationWorkflow(
+        entities=entities,
+        checkpointer=checkpointer,
+    )
+    historical_workflow = HistoricalAnalysisWorkflow(
+        timeline=timeline,
+        beliefs=beliefs,
+        provider=provider,
+        clock=clock,
+        model=settings.llm_small_model,
+    )
+
     workflow = ConversationWorkflow(
         conversations=conversations,
         retrieval=retrieval,
         assembly=assembly,
         provider=provider,
+        # Wired here rather than left None: an unwired router is the "specified but
+        # never built" failure that Step 6b existed to correct in the adapters.
+        router=router,
+        degradation=degradation,
         model=settings.llm_model,
     )
 
@@ -222,6 +294,14 @@ def build_container(settings: Settings | None = None) -> Container:
         operations=operations,
         timeline=timeline,
         conflicts=conflicts,
+        degradation=degradation,
+        coordinator=coordinator,
+        checkpointer=checkpointer,
+        router=router,
+        extraction_workflow=extraction_workflow,
+        correction_workflow=correction_workflow,
+        clarification_workflow=clarification_workflow,
+        historical_workflow=historical_workflow,
     )
 
 
@@ -246,10 +326,33 @@ async def start(container: Container) -> None:
     if recovered:
         _log.info("pending_episodes_recovered", count=len(recovered))
 
+    # Re-queue extractions a previous process left `running` when it died. The
+    # durable status row is the only record that the work was ever owed, and until
+    # this runs those episodes are stored but invisible to retrieval (ADR-008).
+    requeued = await container.coordinator.recover_pending()
+    if requeued:
+        _log.info("extractions_requeued", count=len(requeued))
+
     _log.info("application_started", llm=container.settings.llm_model)
 
 
 async def stop(container: Container) -> None:
+    """Shut down in dependency order.
+
+    The coordinator drains FIRST. Closing the store while a background extraction is
+    mid-transaction races the write it is trying to finish — the episode would stay
+    durable and be retried next start, but the failure would be logged as a spurious
+    error rather than a clean shutdown.
+    """
+    container.coordinator.quiesce()
+    remaining = await container.coordinator.drain()
+    if remaining:
+        _log.warning(
+            "shutdown_with_extractions_in_flight",
+            remaining=remaining,
+            consequence="those episodes stay durable and are retried at next start",
+        )
+
     await container.graph.close()
     await container.store.close()
     _log.info("application_stopped")

@@ -4,8 +4,8 @@
 - **Project Type**: Greenfield
 - **Project Name**: Personal Context AI Assistant
 - **Start Date**: 2026-08-11T12:55:00+05:30
-- **Current Stage**: CONSTRUCTION - Unit 5 Code Generation Part 1 (Planning). Plan written, awaiting approval. Unit 4 code complete (314 tests), not yet activated live.
-- **Next Stage**: Approve the Unit 5 plan, then Code Generation Part 2. Unit 4 live activation still outstanding.
+- **Current Stage**: CONSTRUCTION - Unit 5 code complete (447 tests). Awaiting activation.
+- **Next Stage**: Unit 5 live activation on the Docker machine (migration 0004), then Unit 6 (Management & Inspection). Unit 4 live activation still outstanding and can be verified in the same session.
 - **Core hypothesis**: PROVEN 2026-08-24. A fact stated in one conversation was
   correctly recalled in a separate conversation without being repeated.
 - **Known quality gap**: recall is partial. See Unit 1b activation notes in audit.md.
@@ -81,7 +81,7 @@ Unit 5 plan.
       ADR-015 — it was always empty through Units 1b–3. Pre-Unit-5 audit found and
       fixed Graphiti's empty-query gate silently disabling `search_temporal` and
       `traverse` (310 → 314 tests). Awaiting live activation.
-- [ ] Unit 5 — Orchestration Depth
+- [~] Unit 5 — Orchestration Depth — CODE COMPLETE, awaiting live activation
       - [x] Conditional-stage assessment — Functional Design, NFR Requirements, NFR Design and
             Infrastructure Design all SKIPPED. Rationale in audit.md and in the plan §2.
       - [x] Code Generation Part 1 (Planning) — plan at
@@ -96,7 +96,27 @@ Unit 5 plan.
             bounded-concurrency semaphore that `services.md` specifies for
             `GeminiProviderAdapter` was never built in Unit 1a. Remediated by Step 6b.
             No blocking findings remain.
-      - [ ] Code Generation Part 2 (Generation)
+      - [x] Code Generation Part 2 (Generation) — **CODE COMPLETE 2026-09-04, 447 tests.**
+            Steps 1–17 done. Completion criterion asserted end to end in
+            `tests/integration/test_orchestration_flow.py`: a correction changes what
+            retrieval returns, and a clarification survives a process restart (workflow
+            object discarded, rebuilt against the same checkpoint store).
+            **NFR-02.3 retired** — the SSE `done` event is asserted to arrive with the
+            episode's facts not yet committed, which would fail against the old
+            synchronous code.
+            Two bugs found in shipped code: `graph.aget_state()` never returns None (an
+            unknown thread yields a truthy StateSnapshot with `created_at=None`), so
+            `CorrectionWorkflow.resume` restarted the graph and raised KeyError instead of
+            MemoryNotFound — fixed in both resume paths; and the RESILIENCY-10 fix from
+            Step 6b had shipped with no test coverage at all, now 17 tests.
+            One requirement was nearly traded away for latency: moving extraction off the
+            response path silently dropped contradiction (FR-05.6) and ambiguity (ADR-014)
+            notices, because both are discovered after the reply is sent. Now deferred one
+            turn rather than lost.
+            Deliberate plan deviation: the checkpointer is NOT attached to
+            `ConversationWorkflow` — no interrupt on that path means durable writes with
+            no reader. Reasoning in the completion summary.
+            Migration 0004 not yet applied; awaiting live activation.
 - [ ] Unit 6 — Management & Inspection
 - [ ] Unit 7 — Lifecycle & Hardening
 - [ ] Build and Test
@@ -163,6 +183,9 @@ These are hard constraints, not preferences. Do not revisit without explicit use
 | C-29 | Graph search results are candidates only. Facts returned to the user MUST be resolved from PostgreSQL, never constructed from Graphiti's edge text (ADR-015). | 2026-08-30 |
 | C-30 | Our `EntityId` is NOT Graphiti's node uuid — they come from independent extraction passes. Graph entity scoping is by NAME. | 2026-08-30 |
 | C-31 | Cross-encoder reranking MUST be capped. `GeminiRerankerClient.rank` issues one API call per passage. | 2026-08-30 |
+| C-36 | Findings discovered during background extraction (contradictions FR-05.6, ambiguity ADR-014) MUST be delivered, one turn late if necessary. Moving work off the response path may not silently drop a user-facing requirement. | 2026-09-04 |
+| C-37 | `graph.aget_state()` never returns None. Thread existence MUST be checked via `snapshot.created_at is None`, never `snapshot is None`. | 2026-09-04 |
+| C-38 | A workflow gets a checkpointer only if it can interrupt. Checkpointing a linear read path is durable writes with no reader. | 2026-09-04 |
 
 ## Architecture Decisions (all settled)
 

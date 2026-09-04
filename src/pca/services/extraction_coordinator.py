@@ -85,6 +85,24 @@ class ExtractionCoordinator:
             defaultdict(set)
         )
 
+        # Findings that must reach the user but were discovered after their reply had
+        # already been sent.
+        #
+        # This exists because moving extraction off the response path would otherwise
+        # silently drop two things the system is required to surface: contradictions
+        # (FR-05.6 — surface, never resolve) and entity ambiguity (ADR-014). Those are
+        # detected during extraction, which now finishes after the reply.
+        #
+        # They are delivered on the NEXT turn instead, which is exactly when the
+        # barrier has guaranteed the extraction completed. One turn late is the honest
+        # consequence of ADR-008's trade; dropping them would be a silent requirement
+        # violation traded for latency.
+        #
+        # In-process and therefore lost on restart. Acceptable because these are
+        # advisory: the underlying provisional entity and both conflicting facts are
+        # durably stored, and Unit 6's inspection API surfaces them directly.
+        self._notices: dict[ConversationId, list[str]] = defaultdict(list)
+
         # Set = open. Unit 7's backup quiesces the coordinator so the episode log has
         # no in-flight gaps while it runs.
         self._open = asyncio.Event()
@@ -108,7 +126,7 @@ class ExtractionCoordinator:
             return False
 
         task = asyncio.create_task(
-            self._run(episode_id), name=f"extract-{episode_id}"
+            self._run(episode_id, conversation_id), name=f"extract-{episode_id}"
         )
         self._tasks.add(task)
         if conversation_id is not None:
@@ -178,7 +196,8 @@ class ExtractionCoordinator:
             # exists. Recovery is re-running work the table already owns, not
             # claiming it afresh.
             task = asyncio.create_task(
-                self._run(record.episode_id), name=f"recover-{record.episode_id}"
+                self._run(record.episode_id, record.conversation_id),
+                name=f"recover-{record.episode_id}",
             )
             self._tasks.add(task)
             if record.conversation_id is not None:
@@ -232,7 +251,9 @@ class ExtractionCoordinator:
 
     # --------------------------------------------------------------- internals
 
-    async def _run(self, episode_id: EpisodeId) -> None:
+    async def _run(
+        self, episode_id: EpisodeId, conversation_id: ConversationId | None = None
+    ) -> None:
         """Execute one extraction. Never raises — failures are recorded, not thrown.
 
         Nothing awaits this task except the barrier, and the barrier's job is to stop
@@ -290,9 +311,36 @@ class ExtractionCoordinator:
         await self._repository.mark_finished(
             episode_id, ExtractionState.SUCCEEDED, self._clock.now()
         )
+        if conversation_id is not None:
+            self._queue_notices(conversation_id, outcome)
         _log.info(
             "extraction_completed",
             episode_id=str(episode_id),
             facts=outcome.facts_committed,
             needs_clarification=outcome.needs_clarification,
         )
+
+    def _queue_notices(
+        self, conversation_id: ConversationId, outcome: ExtractionOutcome
+    ) -> None:
+        """Hold findings for delivery on the conversation's next turn."""
+        if outcome.contradictions:
+            self._notices[conversation_id].append(
+                "Some of what you said conflicts with what I had recorded: "
+                + "; ".join(outcome.contradictions[:3])
+                + ". Both versions were kept."
+            )
+        if outcome.needs_clarification:
+            self._notices[conversation_id].append(
+                "One or more people mentioned could not be identified "
+                "unambiguously. The details were saved separately pending review."
+            )
+
+    def take_notices(self, conversation_id: ConversationId) -> list[str]:
+        """Drain findings owed to this conversation.
+
+        Draining rather than reading: a notice repeated on every subsequent turn would
+        train the user to ignore it, and the condition it describes is reported
+        durably by the inspection API rather than by this transient channel.
+        """
+        return self._notices.pop(conversation_id, [])

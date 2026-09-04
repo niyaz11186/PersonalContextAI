@@ -1475,3 +1475,133 @@ Non-compliant: 02 (inherited, does not constrain Unit 5 code).
 the user; none block this unit.
 
 ---
+
+## 2026-09-04 - Unit 5 Code Generation Part 2 Complete (Kiro, resumed)
+
+Session resumed in Kiro after the VS Code Copilot stretch. `.kiro/steering/aidlc-context.md`
+recreated pointing at the same `aidlc-rules/` tree, with a continuity note. Picked up from
+Steps 10–17, which were the outstanding half of Unit 5.
+
+**380 → 447 tests, all passing.** Migration 0004 still unapplied.
+
+### Started with the gap, not the next feature
+
+The pre-Unit-5 audit had flagged that the Step 6b RESILIENCY-10 fix — the provider
+semaphore and explicit timeouts on every Gemini and Graphiti call — shipped with no test
+coverage, and that the plan itself called this "repeating the original mistake in a
+different place". The original mistake was `services.md` specifying that semaphore during
+Inception and it never being built, invisible for four units.
+
+`tests/unit/test_resiliency_bounds.py` (17 tests) closes it. The assertions are written to
+be non-vacuous on purpose:
+
+- **observed peak concurrency**, not `assert semaphore is not None`, which would pass
+  against code that acquires and immediately releases
+- **that the bound saturates**, because `peak <= limit` alone passes against code that
+  accidentally serialises everything — a performance defect wearing compliance as a disguise
+- **that raising the bound raises observed concurrency**, which fails if the semaphore is
+  ignored entirely and is what makes the other two assertions mean something
+- **that a timeout is retryable** — without that branch an explicit timeout is strictly
+  worse than none, failing calls the pre-existing backoff would have recovered
+- **that the slot is released before the backoff sleep**, timed rather than introspected
+
+### Bug in shipped code: `aget_state` never returns None
+
+Found while building `ClarificationWorkflow`. For an unknown thread, LangGraph 1.2 returns
+a `StateSnapshot` with `values={}`, `next=()`, `created_at=None` — **truthy**. Verified by
+probing the installed package rather than reasoning about it.
+
+`CorrectionWorkflow.resume` guarded with `if await self._graph.aget_state(config) is None:`,
+so the guard never fired. Resuming a bogus thread restarted the graph from empty state and
+raised a bare `KeyError` from a node reading `state["request"]` instead of `MemoryNotFound`.
+`ClarificationWorkflow` had inherited the same guard by copy.
+
+Fixed in both. Regression test added to `test_correction_workflow.py`. Recorded as C-37.
+
+This is the fourth defect in this project found by reading an installed package's source
+rather than trusting the shape of the API — after Graphiti's `uuid` parameter, its
+`center_node_uuid`, and its empty-query gate.
+
+### A requirement nearly traded away for latency
+
+Moving extraction off the response path is the point of ADR-008 and retires NFR-02.3. It
+also **silently dropped two things the system is required to surface**: contradictions
+(FR-05.6 — surface, never pick a winner) and entity ambiguity (ADR-014). Both are
+discovered during extraction, which now finishes after the reply has been sent, and nothing
+was left to report them. The notices simply stopped appearing, and four integration tests
+went red in a way that could easily have been "fixed" by deleting the assertions.
+
+Deferred rather than dropped: `ExtractionCoordinator` holds findings per conversation and
+the API drains them after the barrier — the first moment the extraction that produced them
+is guaranteed complete. They now arrive **one turn late**, which is the honest consequence
+of the trade. Asserted in `test_deferred_findings_reach_the_user_on_the_following_turn`.
+Recorded as C-36.
+
+In-process, so lost on restart. Acceptable as advisory: the provisional entity and both
+conflicting facts are durably stored, and Unit 6's inspection API surfaces them directly.
+
+### Deliberate deviation from the plan
+
+Step 12 called for attaching the Step 5 checkpointer to `ConversationWorkflow`. Not done.
+That graph has no interrupt, so there is nothing to resume, and a checkpoint per
+conversation turn is durable writes with no reader. The same reasoning was applied to
+`HistoricalAnalysisWorkflow`. `ClarificationWorkflow` is where ADR-006's LangGraph
+dependency earns its place, and it is checkpointed. If a later unit adds a mid-conversation
+interrupt, attaching it is a one-line change. Recorded as C-38 and in the completion
+summary; the plan checklist is annotated rather than silently ticked.
+
+### Completion criterion, asserted so it could fail
+
+`tests/integration/test_orchestration_flow.py` (8 tests):
+
+- a correction changes **what retrieval returns**, not merely what the database holds — if
+  retrieval kept returning the original, the assistant would agree it was wrong and then
+  repeat the mistake
+- a clarification survives a restart, asserted by **discarding the workflow object** and
+  rebuilding against the same checkpoint store; resuming through the original would prove
+  nothing
+- the SSE `done` event arrives with the episode's facts **not yet committed** — the
+  assertion that actually retires the Unit 1b exception, and one that fails against the old
+  synchronous code
+- message N+1 sees message N's facts, because the barrier settles the outstanding
+  extraction first
+
+The last two pull against each other, which is precisely why ADR-008 exists.
+
+### Test-double design
+
+Two coordinator doubles, for different reasons, both documented in
+`tests/fakes/coordinator.py`. `InlineExtractionCoordinator` runs extraction during `submit`
+so end-state assertions are deterministic. `DeferredExtractionCoordinator` separates submit
+from settle, without which the NFR-02.3 assertion is vacuous — if extraction has already
+finished by the time the response is built, "the reply did not wait" cannot be
+distinguished from "it was fast".
+
+Concurrency, timeouts, and per-conversation isolation stay in unit tests against the real
+coordinator, where time is controllable. Asserting them through `TestClient` would mean
+sleeping on wall clock and hoping, which produces tests that pass on a fast machine and
+flake on a loaded one — a lesson taken from the resiliency slot-release test, which did
+exactly that at a 0.25s backoff and 0.2s threshold before being rewritten.
+
+### Test-harness bugs found
+
+`test_temporal_flow.send()` created a **new conversation on every call**, so per-conversation
+notices could never carry over between turns. The contradiction was being detected
+correctly all along — the log confirmed it — and filed against a conversation that never
+asked for it.
+
+A corrected fact's **source excerpt still shows the pre-correction wording**. Not a bug:
+`MemoryService.correct` copies the original's provenance to the replacement, the section is
+headed "what the user actually said", and the fact states what is now believed. The two are
+coherent, and it is why the assertion is scoped to the epistemic fact buckets rather than
+the whole prompt — a global assertion would demand the system falsify its own transcript.
+
+### Still open
+
+- `SETUP.md` Gemini free-tier quota documentation (RESILIENCY-09). The per-turn call budget
+  is now materially higher — routing, extraction, conflict classification, reranking — and
+  should be written down before someone hits the limit and reads it as a bug.
+- The four §9 resiliency questions, all scoped to Unit 7.
+- `invalidate_edge` / `entity_divergence` still `NotImplementedError`; `ReindexService` in
+  Unit 7 is the first caller.
+- Live verification of Units 3, 4, and 5. Migration 0004 applies on next startup.

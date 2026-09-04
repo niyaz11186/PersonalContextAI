@@ -474,90 +474,132 @@ that accidental limit.
       state from recomputed state; without it the test passes even if resume re-ran the graph
 
 ### Step 10 — `HistoricalAnalysisWorkflow` (L2)
-- [ ] `src/pca/orchestration/historical_workflow.py`, nodes per `services.md` Workflow 4
-- [ ] The routing split that is the point of this workflow: *"what was true"* →
+- [x] `src/pca/orchestration/historical_workflow.py`, nodes per `services.md` Workflow 4
+- [x] The routing split that is the point of this workflow: *"what was true"* →
       `TimelineService.state_at`; *"what did I think"* → `BeliefHistoryService.believed_at`.
-      Getting this wrong produces a confidently wrong answer, so it is asserted directly
-- [ ] Time-range resolution through `LLMProviderPort.structured`, then deterministic arithmetic
+      `_route` kept a pure `staticmethod` so the decision is assertable without standing up
+      three services (13 tests)
+- [x] Time-range resolution through `LLMProviderPort.structured`, then deterministic arithmetic
       (ADR-010 division of labour — the model parses, our code computes)
+- [x] Interpretation failure defaults to the WORLD axis. Being wrong toward world time is less
+      damaging: reporting what was true when asked what we thought is unhelpful, whereas
+      reporting a retracted belief as fact asserts a falsehood
+- [x] **No checkpointer.** Pure read path, never interrupts — see Step 12 note
 
 ### Step 11 — `ClarificationWorkflow` (L2)
-- [ ] `src/pca/orchestration/clarification_workflow.py`, nodes per `services.md` Workflow 5
-- [ ] `run(ambiguity)` interrupts via `langgraph.types.interrupt`; `resume(thread_id, answer)`
+- [x] `src/pca/orchestration/clarification_workflow.py`, nodes per `services.md` Workflow 5
+- [x] `run(ambiguity)` interrupts via `langgraph.types.interrupt`; `resume(thread_id, answer)`
       continues via `Command(resume=...)`
-- [ ] Compiled with the Step 5 checkpointer — this is the one place ADR-006's LangGraph
+- [x] Compiled with the Step 5 checkpointer — this is the one place ADR-006's LangGraph
       dependency actually earns its place
-- [ ] Hard rule: **may only write memory after receiving a user answer.** It never resolves
-      ambiguity on its own authority (ADR-014)
-- [ ] Triggered by `CommitReceipt.needs_clarification`, which Unit 2 already sets and which is
-      currently only turned into a passive notice string
+- [x] Hard rule: **may only write memory after receiving a user answer.** Enforced
+      *structurally*: the only edge into `_apply` comes from `_ask`, so no write is reachable
+      without the interrupt having returned. A graph shape rather than a conditional a later
+      editor could invert. Tests inspect the entity repository MID-SUSPENSION
+- [x] Unrecognised or uncertain answers ABANDON rather than guess. Reaching this workflow
+      already means the system could not decide
+- [ ] Triggered by `CommitReceipt.needs_clarification` — **the receipt is read and the notice
+      delivered (C-36), but nothing yet auto-launches this workflow from it.** The workflow is
+      complete and callable; wiring the trigger belongs with Unit 6's management API, which is
+      where a user can act on the question
 
 ### Step 12 — Rewire `ConversationWorkflow` and the API
-- [ ] `src/pca/orchestration/conversation_workflow.py`: add the `classify` node; on retrieval
-      failure apply `DegradationPolicy.on_retrieval_failure` and proceed with conversation-only
-      context plus disclosure, rather than failing; attach the checkpointer; pass intent to
-      `RetrievalService.budget_for(intent)`
-- [ ] `src/pca/services/retrieval.py`: `budget_for` accepts an optional intent (the Unit 1b
-      comment anticipates exactly this)
-- [ ] `src/pca/api/conversation.py`: barrier per D-1, `submit` after the stream, inline
-      extraction removed, disclosure notices sourced from `DegradationPolicy`
-- [ ] Clarification endpoint per D-3
-- [ ] Update the Unit 1b docstrings that promise this work — they currently say "Unit 5 adds…"
-      and would otherwise become stale claims about a unit that has shipped
+- [x] `classify` node added at START. A decision supplied by the caller is REUSED rather than
+      recomputed — the API classifies in order to route, and re-classifying here would spend a
+      second model call on the response path to reach the same answer (D-4 budgets for one)
+- [x] Retrieval failure applies `DegradationPolicy.on_retrieval_failure` and proceeds with
+      conversation-only context; the disclosure is merged into
+      `ContextPackage.degradation_notices` so `render` cannot omit it
+- [x] `SourceOfRecordUnavailable` is **re-raised**, not degraded (C-22). An answer assembled
+      without the system of record would come from Neo4j alone, which ADR-015 designates
+      non-authoritative
+- [x] Intent passed to `RetrievalService.budget_for(intent)` — `budget_for` already accepted an
+      optional intent from Unit 4
+- [x] `src/pca/api/conversation.py`: barrier before generation, `submit` after the stream,
+      inline extraction removed, notices sourced from `DegradationPolicy`
+- [x] **Deviation — the checkpointer is NOT attached.** This graph has no interrupt, so there is
+      nothing to resume, and a checkpoint per conversation turn would be durable writes with no
+      reader. The same reasoning was applied to Step 10. Recorded as C-38; a one-line change if
+      a later unit introduces a mid-conversation interrupt
+- [x] Unit 1b docstrings promising this work updated, so they do not become stale claims about
+      a unit that has shipped
+- [ ] Clarification endpoint per D-3 — **deferred to Unit 6.** The workflow and its
+      `resume(thread_id, answer)` are complete and tested; the HTTP surface belongs with the
+      management API, which is where the rest of the user-facing controls live
 
 ### Step 13 — Composition and lifecycle
-- [ ] `src/pca/composition.py`: construct the checkpoint repository, checkpointer, coordinator,
-      intent router, degradation policy and all four new workflows; extend `Container`
-- [ ] `start()`: coordinator `recover_pending` replaces (or wraps) the bare
-      `episodes.recover_pending`, so recovery restarts *extraction*, not just graph ingestion
-- [ ] `stop()`: `drain` in-flight extraction before closing the store, otherwise shutdown races
-      an open transaction
+- [x] `composition.py`: checkpoint store, checkpointer, coordinator, intent router, degradation
+      policy and all four new workflows constructed; `Container` extended by eight fields
+- [x] `start()`: `coordinator.recover_pending()` added alongside `episodes.recover_pending()`,
+      so recovery restarts *extraction*, not just graph ingestion
+- [x] `stop()`: `quiesce()` then `drain()` **before** closing the store, otherwise shutdown
+      races an in-flight extraction's transaction
 
 ### Step 14 — Health
-- [ ] `src/pca/api/health.py`: extraction backlog by state and in-flight count. A stuck
-      coordinator is otherwise invisible — the API keeps returning 200 and replies look normal
-      while memory silently stops accumulating
+- [x] `src/pca/api/health.py`: new `extraction` dependency reporting backlog by state plus
+      locally in-flight count
+- [x] Healthy only when `failed == 0`. PENDING and RUNNING are normal transient states, so
+      treating a non-zero count of those as unhealthy would make the endpoint cry wolf under
+      ordinary load and train the operator to ignore it
 
 ### Step 15 — Unit tests
-- [ ] `tests/fakes/extraction_status.py`, `tests/fakes/checkpoints.py`
-- [ ] `tests/unit/test_extraction_coordinator.py` — per-conversation isolation (conversation B
-      is not delayed by A), timeout produces a disclosure rather than an exception, duplicate
-      submit is a no-op, `recover_pending` re-queues crashed rows
-- [ ] `tests/unit/test_intent_router.py` — low confidence routes to clarification; FR-02.6
-      commands recognised
-- [ ] `tests/unit/test_degradation_policy.py` — every `Degradation` carries non-empty disclosure
-      text (the NFR-06.5 clause, asserted directly so it cannot be dropped)
-- [ ] `tests/unit/test_checkpointer.py` — round-trip through the fake store; `alist` ordering;
-      namespace isolation (the defect D-6 fixes, pinned so it cannot regress)
-- [ ] `tests/unit/test_correction_workflow.py` — correct vs supersede chosen correctly, and
-      interrupt on weak signal
-- [ ] `tests/unit/test_historical_workflow.py` — "what was true" and "what did I think" reach
-      different services and return different answers for the same date
-- [ ] `tests/unit/test_resiliency_bounds.py` (RESILIENCY-10) — concurrent extraction never exceeds
-      the configured bound; a hung provider call is cut off by the per-call timeout rather than
-      waiting forever; a hung extraction releases its pool slot. Each of these passes trivially
-      against unbounded code if asserted loosely, so the bound is asserted by observing peak
-      concurrency, not by checking the semaphore exists
+
+Most of these were written alongside the component they cover rather than batched here,
+because a test written three steps after the code mostly re-asserts whatever the code does.
+Reconciled against what actually exists:
+
+- [x] `tests/fakes/extraction_status.py`, `tests/fakes/checkpoints.py`
+- [x] `tests/unit/test_extraction_coordinator.py` (14) — per-conversation isolation, timeout
+      discloses rather than raises, duplicate submit is a no-op, `recover_pending` re-queues
+- [x] `tests/unit/test_intent_router.py` (18) — low confidence routes to clarification; FR-02.6
+      commands recognised; command-shaped conversation is NOT prefiltered
+- [x] `tests/unit/test_checkpointer.py` (9) — round-trip, `alist` ordering, namespace isolation,
+      ordinary-vs-special write semantics
+- [x] `tests/unit/test_correction_workflow.py` (13) — the axis decision, both interrupt
+      conditions, resume across a simulated restart
+- [x] `tests/unit/test_extraction_workflow.py` (10) — detection before commit, idempotency,
+      conflict branch
+- [x] `tests/unit/test_clarification_workflow.py` (16) — nothing written before the answer
+      (asserted mid-suspension), restart survival, decline/unrecognised paths, thread isolation
+- [x] `tests/unit/test_historical_workflow.py` (13) — "what was true" and "what did I think"
+      reach different services and return different answers for the same date (Step 10)
+- [x] `tests/unit/test_conversation_degradation.py` (12) — retrieval failure degrades with
+      disclosure, PostgreSQL does NOT degrade, intent shapes the budget, a supplied decision is
+      not re-classified
+- [x] `tests/unit/test_resiliency_bounds.py` (17) — **the gap is closed.** Observed peak
+      concurrency rather than semaphore existence; that the bound saturates (so accidental
+      serialisation cannot pass as compliance); that raising the bound raises observed
+      concurrency (so the other assertions are not vacuous); hung calls cut off; timeout IS
+      retryable; slot released before the backoff sleep; `stream()` bounds establishment not
+      consumption; every `GraphitiMemoryAdapter` search path guarded
+- [ ] `tests/unit/test_degradation_policy.py` — **still open.** `Degradation.__post_init__`
+      enforces non-empty disclosure at construction (C-34), and `on_retrieval_failure` and
+      `on_extraction_timeout` are both exercised indirectly. A direct test that every method
+      returns non-empty text would still be worth having, and is cheap
 
 ### Step 16 — Integration tests
-- [ ] `tests/integration/test_orchestration_flow.py`
-- [ ] **Completion criterion, half 1**: correction workflow updates a memory, and a subsequent
-      retrieval returns the corrected value rather than the original
-- [ ] **Completion criterion, half 2**: clarification interrupts; the checkpointer is then
-      re-instantiated against the same store to simulate a process restart; `resume` continues
-      with intact state. Asserting this *without* discarding the in-memory graph object would
-      test nothing — the state would still be in the process
-- [ ] NFR-02.3: the SSE `done` event arrives before extraction completes. This is the assertion
-      that actually retires the Unit 1b exception; a test that only checks extraction eventually
-      happens would pass against the current synchronous code
-- [ ] Barrier ordering: message N+1's reply is generated after N's facts are committed
+- [x] `tests/integration/test_orchestration_flow.py` (8)
+- [x] **Completion criterion, half 1**: a correction changes what **retrieval returns**, and the
+      corrected value reaches the next reply's context. Two tests — the database holding the
+      right value is not sufficient if retrieval keeps serving the original
+- [x] **Completion criterion, half 2**: clarification interrupts; the workflow object is
+      DISCARDED and rebuilt against the same checkpoint store; `resume` continues with intact
+      state and applies the merge
+- [x] NFR-02.3: the SSE `done` event arrives with the episode's facts **not yet committed**.
+      Required a second test double (`DeferredExtractionCoordinator`) — with inline extraction
+      the assertion is vacuous, because "did not wait" cannot be distinguished from "was fast"
+- [x] Barrier ordering: message N+1 sees message N's facts, with extraction deferred so the
+      second turn would otherwise retrieve against an empty store
+- [x] Deferred findings (C-36): a notice discovered during background extraction is delivered on
+      the following turn rather than dropped
 
 ### Step 17 — Documentation
-- [ ] `aidlc-docs/construction/unit-5-orchestration-depth/completion-summary.md` — matching the
-      Unit 3/4 format: completion criterion, what was built, design decisions worth recording,
-      bugs found in existing code
-- [ ] Update `aidlc-docs/aidlc-state.md`: Unit 5 status, new test count, any new C-NN constraints
-- [ ] Append to `aidlc-docs/audit.md`
+- [x] `aidlc-docs/construction/unit-5-orchestration-depth/completion-summary.md`
+- [x] `aidlc-docs/aidlc-state.md` — Unit 5 status, 447 tests, C-36/C-37/C-38
+- [x] `aidlc-docs/audit.md`
+- [ ] `SETUP.md` Gemini free-tier quota note (RESILIENCY-09, carried from Step 6b). The per-turn
+      call budget is now materially higher — routing, extraction, conflict classification,
+      reranking — and should be documented before someone hits the limit and reads it as a bug
 
 ---
 

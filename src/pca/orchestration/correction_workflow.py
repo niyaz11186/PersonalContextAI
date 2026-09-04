@@ -337,7 +337,13 @@ class CorrectionWorkflow:
     async def resume(self, thread_id: str, answer: str) -> CorrectionResult:
         """Continue an interrupted correction with the user's answer."""
         config = {"configurable": {"thread_id": thread_id}}
-        if await self._graph.aget_state(config) is None:
+        # `aget_state` NEVER returns None. An unknown thread yields a StateSnapshot
+        # with `values={}` and `created_at=None`, which is truthy — so the original
+        # `is None` check never fired, and resuming a bogus thread restarted the graph
+        # from empty state and raised a bare KeyError instead of this domain error.
+        # Verified against langgraph 1.2.
+        snapshot = await self._graph.aget_state(config)
+        if snapshot is None or snapshot.created_at is None:
             raise MemoryNotFound(f"no correction in progress for {thread_id}")
 
         final: CorrectionState = await self._graph.ainvoke(

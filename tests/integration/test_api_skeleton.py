@@ -27,8 +27,15 @@ from pca.config.schema_drift import SchemaDriftCheck
 from pca.config.settings import Settings
 from pca.main import create_app
 from pca.orchestration.conversation_workflow import ConversationWorkflow
+from pca.orchestration.checkpointer import PostgresCheckpointSaver
+from pca.orchestration.clarification_workflow import ClarificationWorkflow
+from pca.orchestration.correction_workflow import CorrectionWorkflow
+from pca.orchestration.extraction_workflow import ExtractionWorkflow
+from pca.orchestration.historical_workflow import HistoricalAnalysisWorkflow
+from pca.orchestration.intent_router import IntentRouter
 from pca.services.belief_history import BeliefHistoryService
 from pca.services.conflicts import ConflictDetectionService
+from pca.services.degradation import DegradationPolicy
 from pca.services.context_assembly import ContextAssemblyService
 from pca.services.conversation import ConversationService
 from pca.services.entities import EntityService
@@ -41,7 +48,12 @@ from pca.services.retrieval import RetrievalService
 from pca.services.salience import SalienceScorer
 from pca.services.time_resolver import TimeResolver
 from pca.services.timeline import TimelineService
+from tests.fakes.checkpoints import FakeCheckpointStore
 from tests.fakes.clock import FakeClock
+from tests.fakes.coordinator import (
+    DeferredExtractionCoordinator,
+    InlineExtractionCoordinator,
+)
 from tests.fakes.graph import FakeMemoryGraph
 from tests.fakes.history_repositories import (
     FakeBeliefRepository,
@@ -88,7 +100,14 @@ class _StubProviderHealth:
 def build_fake_container(
     provider: FakeLLMProvider | None = None,
     graph: FakeMemoryGraph | None = None,
+    defer_extraction: bool = False,
 ) -> Container:
+    """Assemble the app against fakes.
+
+    `defer_extraction` swaps the inline coordinator for the deferring one, which is
+    needed by any test asserting that the reply does not wait for extraction — inline
+    extraction makes that assertion vacuous. See tests/fakes/coordinator.py.
+    """
     settings = Settings(
         GOOGLE_API_KEY="test-key",
         PCA_USER_TIMEZONE="Asia/Kolkata",
@@ -153,6 +172,46 @@ def build_fake_container(
     )
     assembly = ContextAssemblyService(provenance=provenance)
 
+    # ------------------------------------------------------ Unit 5 orchestration
+    #
+    # The extraction pipeline is assembled for real, then driven by an INLINE
+    # coordinator rather than the background one. See tests/fakes/coordinator.py:
+    # asserting on committed memory after an HTTP call would otherwise race the
+    # background task. Barrier and scheduling semantics are covered against the real
+    # coordinator in tests/unit/test_extraction_coordinator.py.
+    degradation = DegradationPolicy()
+    conflicts_service = ConflictDetectionService(
+        memory=memory_repository,  # type: ignore[arg-type]
+        llm=provider,  # type: ignore[arg-type]
+    )
+    extraction_service = ExtractionService(
+        provider=provider,  # type: ignore[arg-type]
+        resolver=TimeResolver(),
+        salience=SalienceScorer(),
+    )
+    extraction_workflow = ExtractionWorkflow(
+        episodes=episodes,
+        episode_repository=episode_repository,
+        extraction=extraction_service,
+        conflicts=conflicts_service,
+        memory=memory,
+        provenance=provenance,
+    )
+    coordinator = (
+        DeferredExtractionCoordinator(runner=extraction_workflow.run)
+        if defer_extraction
+        else InlineExtractionCoordinator(runner=extraction_workflow.run)
+    )
+    checkpointer = PostgresCheckpointSaver(FakeCheckpointStore())  # type: ignore[arg-type]
+    beliefs_service = BeliefHistoryService(
+        repository=belief_repository, clock=clock  # type: ignore[arg-type]
+    )
+    timeline_service = TimelineService(
+        memory=memory_repository,  # type: ignore[arg-type]
+        beliefs=belief_repository,  # type: ignore[arg-type]
+        clock=clock,  # type: ignore[arg-type]
+    )
+
     container = Container(
         settings=settings,
         clock=clock,  # type: ignore[arg-type]
@@ -163,11 +222,7 @@ def build_fake_container(
         schema_drift=SchemaDriftCheck(store),  # type: ignore[arg-type]
         conversations=conversations,
         episodes=episodes,
-        extraction=ExtractionService(
-            provider=provider,  # type: ignore[arg-type]
-            resolver=TimeResolver(),
-            salience=SalienceScorer(),
-        ),
+        extraction=extraction_service,
         retrieval=retrieval,
         assembly=assembly,
         conversation_workflow=ConversationWorkflow(
@@ -175,20 +230,36 @@ def build_fake_container(
             retrieval=retrieval,
             assembly=assembly,
             provider=provider,  # type: ignore[arg-type]
+            degradation=degradation,
         ),
         entities=entities,
         provenance=provenance,
         memory=memory,
-        beliefs=BeliefHistoryService(repository=belief_repository, clock=clock),  # type: ignore[arg-type]
+        beliefs=beliefs_service,
         operations=MemoryOperationLog(repository=operation_repository, clock=clock),  # type: ignore[arg-type]
-        timeline=TimelineService(
-            memory=memory_repository,  # type: ignore[arg-type]
-            beliefs=belief_repository,  # type: ignore[arg-type]
+        timeline=timeline_service,
+        conflicts=conflicts_service,
+        degradation=degradation,
+        coordinator=coordinator,  # type: ignore[arg-type]
+        checkpointer=checkpointer,
+        router=IntentRouter(provider=provider),  # type: ignore[arg-type]
+        extraction_workflow=extraction_workflow,
+        correction_workflow=CorrectionWorkflow(
+            retrieval=retrieval,
+            memory=memory,
+            memory_repository=memory_repository,  # type: ignore[arg-type]
+            provider=provider,  # type: ignore[arg-type]
             clock=clock,  # type: ignore[arg-type]
+            checkpointer=checkpointer,
         ),
-        conflicts=ConflictDetectionService(
-            memory=memory_repository,  # type: ignore[arg-type]
-            llm=provider,  # type: ignore[arg-type]
+        clarification_workflow=ClarificationWorkflow(
+            entities=entities, checkpointer=checkpointer
+        ),
+        historical_workflow=HistoricalAnalysisWorkflow(
+            timeline=timeline_service,
+            beliefs=beliefs_service,
+            provider=provider,  # type: ignore[arg-type]
+            clock=clock,  # type: ignore[arg-type]
         ),
     )
 
@@ -266,7 +337,16 @@ def test_health_reports_each_dependency_separately(client: TestClient) -> None:
     body = client.get("/health").json()
 
     names = {d["name"] for d in body["dependencies"]}
-    assert names == {"postgres", "neo4j", "gemini", "memory_ingestion"}
+    assert names == {
+        "postgres",
+        "neo4j",
+        "gemini",
+        "memory_ingestion",
+        # Added by Unit 5. Distinct from memory_ingestion: an episode can be in the
+        # graph while its extraction is still pending, and a coordinator that has
+        # stopped draining is otherwise invisible.
+        "extraction",
+    }
     assert body["healthy"] is True
 
 
@@ -599,9 +679,19 @@ def test_ambiguous_entity_produces_a_user_facing_notice() -> None:
 
     with make_client(container) as client:
         conversation_id = client.post("/conversations", json={}).json()["id"]
-        response = client.post(
+        client.post(
             f"/conversations/{conversation_id}/messages",
             json={"content": "Priya called me."},
+        )
+        # The notice arrives on the NEXT turn. Unit 5 moved extraction off the
+        # response path (ADR-008), so the ambiguity is discovered after the first
+        # reply has already been sent. The barrier guarantees the extraction has
+        # finished by the time this second message is handled, which is the first
+        # moment the finding can be reported — one turn late rather than dropped,
+        # because ADR-014 requires it be surfaced.
+        response = client.post(
+            f"/conversations/{conversation_id}/messages",
+            json={"content": "Anything else?"},
         )
 
     events = sse_events(response.text)
@@ -626,9 +716,17 @@ def test_memory_write_failure_is_disclosed_and_does_not_lose_the_message() -> No
             json={"content": "Something important"},
         )
 
-        events = sse_events(response.text)
-        assert "notices" in events[-1]
-        assert any("could not be added to memory" in n for n in events[-1]["notices"])
-
+        # The durability guarantee is what this test is really about, and it is
+        # unchanged by Unit 5: the message survives regardless of what extraction does.
         history = client.get(f"/conversations/{conversation_id}/messages").json()
         assert history[0]["content"] == "Something important"
+
+        # The extraction failure itself is now recorded by the coordinator rather than
+        # reported inline, because it happens after the reply. Asserted against the
+        # coordinator so the test pins the behaviour that exists rather than the one
+        # that used to.
+        assert container.coordinator.errors, (  # type: ignore[attr-defined]
+            "a failing extraction must be recorded, not swallowed"
+        )
+        events = sse_events(response.text)
+        assert events[-1]["done"] is True

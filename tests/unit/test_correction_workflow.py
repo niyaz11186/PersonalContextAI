@@ -23,6 +23,7 @@ from pca.domain.enums import (
     OperationKind,
     Origin,
 )
+from pca.domain.errors import MemoryNotFound
 from pca.domain.ids import ConversationId, EpisodeId, MemoryId
 from pca.domain.memory import Fact, ProvenanceRef
 from pca.domain.orchestration import CorrectionRequest
@@ -305,6 +306,23 @@ async def test_resuming_with_wrong_corrects(harness: Harness) -> None:
     assert result.operation is OperationKind.CORRECT
     updated = await harness.memory_repo.get_fact(fact.id)
     assert updated is not None and updated.belief.retracted_at is not None
+
+
+async def test_resuming_an_unknown_thread_raises_rather_than_restarting(
+    harness: Harness,
+) -> None:
+    """Regression: `aget_state` never returns None.
+
+    For an unknown thread LangGraph 1.2 returns a StateSnapshot with `values={}` and
+    `created_at=None` — truthy, so the original `is None` guard never fired. Resuming a
+    bogus thread therefore restarted the graph from empty state and raised a bare
+    KeyError from a node reading `state["request"]`, instead of this domain error.
+
+    Found while building ClarificationWorkflow, which had the identical guard copied
+    from here. Pinned in both places.
+    """
+    with pytest.raises(MemoryNotFound):
+        await harness.workflow().resume("correction:does-not-exist", "wrong")
 
 
 async def test_an_unrecognised_answer_takes_the_conservative_axis(
